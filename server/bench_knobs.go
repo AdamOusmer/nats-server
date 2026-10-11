@@ -35,6 +35,9 @@ var (
 	// every n deliveries instead of every delivery. A new consumer leader
 	// can resend up to n-1 messages the old one already delivered.
 	benchAckNoneEvery = benchUint("NATS_BENCH_ACKNONE_PROPOSE_EVERY")
+	// benchDeliverBatch keeps the consumer lock across up to n consecutive
+	// deliveries instead of releasing it after each one.
+	benchDeliverBatch = int(benchUint("NATS_BENCH_DELIVER_BATCH"))
 )
 
 func benchFlag(key string) bool {

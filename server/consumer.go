@@ -5438,6 +5438,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 	mset.cfgMu.RUnlock()
 
 	var err error
+	held, batched := false, 0
 
 	// Deliver all the msgs we have now, once done or on a condition, we wait for new ones.
 	for {
@@ -5451,7 +5452,10 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			wrn, wrb int
 		)
 
-		o.mu.Lock()
+		if !held {
+			o.mu.Lock()
+			held = true
+		}
 
 		// consumer is closed when mset is set to nil.
 		if o.closed || o.mset == nil {
@@ -5607,7 +5611,10 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			hb.Reset(hbd)
 		}
 
-		o.mu.Unlock()
+		if batched++; benchDeliverBatch <= 1 || batched >= benchDeliverBatch {
+			o.mu.Unlock()
+			held, batched = false, 0
+		}
 		continue
 
 	waitForMsgs:
@@ -5633,6 +5640,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		// We will wait here for new messages to arrive.
 		mch, odsubj := o.mch, o.cfg.DeliverSubject
 		o.mu.Unlock()
+		held, batched = false, 0
 
 		select {
 		case <-mch:
