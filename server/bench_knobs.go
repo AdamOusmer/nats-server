@@ -28,6 +28,9 @@ var (
 	// into one write, so a flush becomes one TLS record instead of one per
 	// buffer.
 	benchTLSCollapse = benchFlag("NATS_BENCH_TLS_COLLAPSE")
+	// benchProposeCoalesce delays a consumer's proposal forwarder by this
+	// duration after a kick, so one append entry carries more updates.
+	benchProposeCoalesce = benchDuration("NATS_BENCH_PROPOSE_COALESCE")
 )
 
 func benchFlag(key string) bool {

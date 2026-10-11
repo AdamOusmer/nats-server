@@ -3050,6 +3050,9 @@ func (o *consumer) loopAndForwardProposals(node RaftNode, qch, pch chan struct{}
 			forwardProposals()
 			return
 		case <-pch:
+			if benchProposeCoalesce > 0 {
+				time.Sleep(benchProposeCoalesce)
+			}
 			if err := forwardProposals(); err != nil {
 				return
 			}
