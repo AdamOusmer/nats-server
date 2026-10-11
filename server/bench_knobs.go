@@ -55,6 +55,9 @@ var (
 	benchEvictBatch = int(benchUint("NATS_BENCH_EVICT_BATCH"))
 	// benchStoreSlab allocates memory store messages from shared slabs.
 	benchStoreSlab = benchFlag("NATS_BENCH_STORE_SLAB")
+	// benchIntern interns the subject and batch id the stream apply loop
+	// decodes for every replicated message.
+	benchIntern = benchFlag("NATS_BENCH_INTERN")
 )
 
 func benchFlag(key string) bool {

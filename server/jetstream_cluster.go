@@ -4586,7 +4586,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 	}
 
 	// State to check for atomic batch completeness before applying it.
-	batch := &batchApply{}
+	batch := &batchApply{intern: newApplyInterner()}
 	defer func() {
 		for _, bce := range batch.entries {
 			bce.ReturnToPool()
@@ -5529,7 +5529,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, n RaftNode, ce *CommittedE
 			}
 			buf, op := e.Data, entryOp(e.Data[0])
 			if op == batchMsgOp {
-				batchId, batchSeq, _, _, err := decodeBatchMsg(buf[1:])
+				batchId, batchSeq, _, _, err := decodeBatchMsgIntern(buf[1:], batch.intern)
 				if err != nil {
 					return 0, err
 				}
@@ -5578,7 +5578,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, n RaftNode, ce *CommittedE
 				}
 				continue
 			} else if op == batchCommitMsgOp {
-				batchId, batchSeq, _, _, err := decodeBatchMsg(buf[1:])
+				batchId, batchSeq, _, _, err := decodeBatchMsgIntern(buf[1:], batch.intern)
 				if err != nil {
 					return 0, err
 				}
@@ -5647,12 +5647,12 @@ func (js *jetStream) applyStreamEntries(mset *stream, n RaftNode, ce *CommittedE
 						if entry.Type != EntryNormal {
 							continue
 						}
-						_, _, op, buf, err = decodeBatchMsg(entry.Data[1:])
+						_, _, op, buf, err = decodeBatchMsgIntern(entry.Data[1:], batch.intern)
 						if err != nil {
 							clearAndUnlock()
 							return 0, err
 						}
-						if err = js.applyStreamMsgOp(mset, op, buf, isRecovering, false); err != nil {
+						if err = js.applyStreamMsgOp(mset, op, buf, isRecovering, false, batch.intern); err != nil {
 							clearAndUnlock()
 							return 0, err
 						}
@@ -5678,12 +5678,12 @@ func (js *jetStream) applyStreamEntries(mset *stream, n RaftNode, ce *CommittedE
 					if entry.Type != EntryNormal {
 						continue
 					}
-					_, _, op, buf, err = decodeBatchMsg(entry.Data[1:])
+					_, _, op, buf, err = decodeBatchMsgIntern(entry.Data[1:], batch.intern)
 					if err != nil {
 						clearAndUnlock()
 						return 0, err
 					}
-					if err = js.applyStreamMsgOp(mset, op, buf, isRecovering, false); err != nil {
+					if err = js.applyStreamMsgOp(mset, op, buf, isRecovering, false, batch.intern); err != nil {
 						clearAndUnlock()
 						return 0, err
 					}
@@ -5700,7 +5700,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, n RaftNode, ce *CommittedE
 			switch op {
 			case streamMsgOp, compressedStreamMsgOp:
 				mbuf := buf[1:]
-				if err := js.applyStreamMsgOp(mset, op, mbuf, isRecovering, true); err != nil {
+				if err := js.applyStreamMsgOp(mset, op, mbuf, isRecovering, true, batch.intern); err != nil {
 					return 0, err
 				}
 
@@ -5944,7 +5944,7 @@ func (mset *stream) skipBatchIfRecovering(batch *batchApply, buf []byte) (bool, 
 
 // needIsolation should be false only if the caller already holds isolateMu
 // across a whole atomic batch; mset.mu must NOT be held by the caller.
-func (js *jetStream) applyStreamMsgOp(mset *stream, op entryOp, mbuf []byte, isRecovering bool, needIsolation bool) error {
+func (js *jetStream) applyStreamMsgOp(mset *stream, op entryOp, mbuf []byte, isRecovering bool, needIsolation bool, in *strInterner) error {
 	s := js.srv
 
 	if op == compressedStreamMsgOp {
@@ -5955,7 +5955,7 @@ func (js *jetStream) applyStreamMsgOp(mset *stream, op entryOp, mbuf []byte, isR
 		}
 	}
 
-	subject, reply, hdr, msg, lseq, ts, sourced, err := decodeStreamMsg(mbuf)
+	subject, reply, hdr, msg, lseq, ts, sourced, err := decodeStreamMsgIntern(mbuf, in)
 	if err != nil {
 		mset.mu.RLock()
 		acc, name, node := mset.accountLocked(false), mset.nameLocked(false), mset.node
@@ -12839,6 +12839,10 @@ func decodeConsumerAssignmentCompressed(buf []byte) (*consumerAssignment, error)
 var errBadStreamMsg = errors.New("jetstream cluster bad replicated stream msg")
 
 func decodeStreamMsg(buf []byte) (subject, reply string, hdr, msg []byte, lseq uint64, ts int64, sourced bool, err error) {
+	return decodeStreamMsgIntern(buf, nil)
+}
+
+func decodeStreamMsgIntern(buf []byte, in *strInterner) (subject, reply string, hdr, msg []byte, lseq uint64, ts int64, sourced bool, err error) {
 	var le = binary.LittleEndian
 	if len(buf) < 26 {
 		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, false, errBadStreamMsg
@@ -12852,7 +12856,7 @@ func decodeStreamMsg(buf []byte) (subject, reply string, hdr, msg []byte, lseq u
 	if len(buf) < sl {
 		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, false, errBadStreamMsg
 	}
-	subject = string(buf[:sl])
+	subject = in.str(buf[:sl])
 	buf = buf[sl:]
 	if len(buf) < 2 {
 		return _EMPTY_, _EMPTY_, nil, nil, 0, 0, false, errBadStreamMsg
@@ -12899,6 +12903,10 @@ func decodeStreamMsg(buf []byte) (subject, reply string, hdr, msg []byte, lseq u
 }
 
 func decodeBatchMsg(buf []byte) (batchId string, batchSeq uint64, op entryOp, mbuf []byte, err error) {
+	return decodeBatchMsgIntern(buf, nil)
+}
+
+func decodeBatchMsgIntern(buf []byte, in *strInterner) (batchId string, batchSeq uint64, op entryOp, mbuf []byte, err error) {
 	var le = binary.LittleEndian
 	if len(buf) < 2 {
 		return _EMPTY_, 0, 0, nil, errBadStreamMsg
@@ -12908,7 +12916,7 @@ func decodeBatchMsg(buf []byte) (batchId string, batchSeq uint64, op entryOp, mb
 	if len(buf) < bl {
 		return _EMPTY_, 0, 0, nil, errBadStreamMsg
 	}
-	batchId = string(buf[:bl])
+	batchId = in.str(buf[:bl])
 	buf = buf[bl:]
 	var n int
 	batchSeq, n = binary.Uvarint(buf)

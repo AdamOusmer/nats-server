@@ -574,6 +574,7 @@ type batchApply struct {
 	entries    []*CommittedEntry // Previous entries that are part of this batch.
 	entryStart int               // The index into an entry indicating the first message of the batch.
 	maxApplied uint64            // Applied value before the entry containing the first message of the batch.
+	intern     *strInterner      // Interns decoded subjects and batch ids, owned by the apply loop.
 }
 
 // clearBatchState clears in-memory apply-batch-related state.
