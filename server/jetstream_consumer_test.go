@@ -13914,3 +13914,83 @@ func TestJetStreamConsumerEphemeralPullDefaultInactiveThresholdAfterRestart(t *t
 		return nil
 	})
 }
+
+func TestJetStreamConsumerAckNoneLimitEvictionDoesNotWaitForLock(t *testing.T) {
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	payload := make([]byte, 100)
+	// The byte limit holds exactly 50 messages, each subject is one byte.
+	msgSize := memStoreMsgSize("a", nil, payload)
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"a", "b"},
+		Storage:  nats.MemoryStorage,
+		MaxBytes: int64(50 * msgSize),
+	})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "NONE", FilterSubject: "a", AckPolicy: nats.AckNonePolicy})
+	require_NoError(t, err)
+
+	// Odd sequences on "a", even on "b".
+	publish := func(n int) {
+		t.Helper()
+		for range n / 2 {
+			_, err := js.Publish("a", payload)
+			require_NoError(t, err)
+			_, err = js.Publish("b", payload)
+			require_NoError(t, err)
+		}
+	}
+	publish(40)
+
+	// Deliver the "a" messages up to stream sequence 19.
+	sub, err := js.PullSubscribe("a", "NONE", nats.Bind("TEST", "NONE"))
+	require_NoError(t, err)
+	require_Len(t, len(fetchMsgs(t, sub, 10, 5*time.Second)), 10)
+	require_NoError(t, sub.Unsubscribe())
+
+	mset, err := s.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("NONE")
+	require_NotNil(t, o)
+
+	// With the consumer lock held, evicting sequences 1-50 must not wait for it.
+	o.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		publish(60)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		o.mu.Unlock()
+		t.Fatal("publishing waited for the consumer lock")
+	}
+	o.rmMu.Lock()
+	queued := len(o.rmq)
+	o.rmMu.Unlock()
+	o.mu.Unlock()
+	// 1-50 hold 25 "a" and 25 "b" messages, the consumer matches the "a" ones.
+	require_Equal(t, queued, 25)
+
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		ci, err := js.ConsumerInfo("TEST", "NONE")
+		if err != nil {
+			return err
+		}
+		// The "a" messages left are sequences 51, 53, ... 99.
+		if ci.NumPending != 25 {
+			return fmt.Errorf("expected 25 pending, got %d", ci.NumPending)
+		}
+		if ci.NumAckPending != 0 || ci.Delivered.Stream != 19 {
+			return fmt.Errorf("unexpected state: ack pending %d, delivered %d", ci.NumAckPending, ci.Delivered.Stream)
+		}
+		return nil
+	})
+	require_False(t, o.rmQueued.Load())
+}

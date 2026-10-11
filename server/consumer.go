@@ -566,6 +566,13 @@ type consumer struct {
 	// If standalone/single-server, the offline reason needs to be stored directly in the consumer.
 	// Otherwise, if clustered it will be part of the consumer assignment.
 	offlineReason string
+
+	// Stream removals an AckNone consumer could not take its lock for, see
+	// decStreamPending. ackNone is set at creation, the policy cannot change.
+	ackNone  bool
+	rmMu     sync.Mutex
+	rmq      []streamRemoval
+	rmQueued atomic.Bool
 }
 
 // A single subject filter.
@@ -1224,6 +1231,7 @@ func (mset *stream) addConsumerWithAssignmentAndMode(config *ConsumerConfig, ona
 		client:    s.createInternalJetStreamClient(),
 		sysc:      s.createInternalJetStreamClient(),
 		cfg:       *config,
+		ackNone:   config.AckPolicy == AckNone,
 		direct:    config.Direct,
 		sourcing:  config.Sourcing,
 		dsubj:     config.DeliverSubject,
@@ -4982,6 +4990,7 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 	if o.mset == nil || o.mset.store == nil {
 		return nil, 0, errBadConsumer
 	}
+	o.applyQueuedRemovalsLocked()
 	// Process redelivered messages before looking at possibly "skip list" (deliver last per subject)
 	if o.hasRedeliveries() {
 		var seq, dc uint64
@@ -5706,6 +5715,7 @@ func (o *consumer) setMaxPendingBytes(limit int) {
 // This does some quick sanity checks to see if we should re-calculate num pending.
 // Lock should be held.
 func (o *consumer) checkNumPending() (uint64, error) {
+	o.applyQueuedRemovalsLocked()
 	if o.mset != nil && o.mset.store != nil {
 		var state StreamState
 		o.mset.store.FastState(&state)
@@ -5757,6 +5767,8 @@ func (o *consumer) streamNumPendingLocked() (uint64, error) {
 // Depends on delivery policy, for last per subject we calculate differently.
 // Lock should be held.
 func (o *consumer) streamNumPending() (uint64, error) {
+	// Removals still queued must not count against the recalculated value.
+	o.applyQueuedRemovalsLocked()
 	if o.mset == nil || o.mset.store == nil || !o.isLeader() {
 		o.npc, o.npf = 0, 0
 		return 0, nil
@@ -7036,8 +7048,62 @@ func (o *consumer) requestNextMsgSubject() string {
 }
 
 func (o *consumer) decStreamPending(sseq uint64, subj string) {
-	o.mu.Lock()
+	// The stream calls this for every removed message, often with its own lock
+	// held. An AckNone consumer has no pending messages to terminate, so rather
+	// than wait for its lock it queues the removal, which is applied before the
+	// consumer next loads from the stream or reports its pending count.
+	if o.ackNone {
+		if !o.mu.TryLock() {
+			o.rmMu.Lock()
+			o.rmq = append(o.rmq, streamRemoval{sseq, subj})
+			o.rmQueued.Store(true)
+			o.rmMu.Unlock()
+			return
+		}
+		o.applyQueuedRemovalsLocked()
+	} else {
+		o.mu.Lock()
+	}
+	p, rdc, wasPending := o.decStreamPendingLocked(sseq, subj)
+	o.mu.Unlock()
 
+	// If it was pending process it like an ack.
+	if wasPending {
+		// We could have the lock for the stream so do this in a go routine.
+		// TODO(dlc) - We should do this with ipq vs naked go routines.
+		go o.processTerm(sseq, p.Sequence, rdc, ackTermUnackedLimitsReason, _EMPTY_)
+	}
+}
+
+// streamRemoval is a message removed from the stream.
+type streamRemoval struct {
+	seq  uint64
+	subj string
+}
+
+// applyQueuedRemovalsLocked applies the removals decStreamPending queued, in
+// the order they happened.
+// Lock should be held.
+func (o *consumer) applyQueuedRemovalsLocked() {
+	if !o.rmQueued.Load() {
+		return
+	}
+	o.rmMu.Lock()
+	q := o.rmq
+	o.rmq = nil
+	o.rmQueued.Store(false)
+	o.rmMu.Unlock()
+	for _, r := range q {
+		if p, rdc, wasPending := o.decStreamPendingLocked(r.seq, r.subj); wasPending {
+			go o.processTerm(r.seq, p.Sequence, rdc, ackTermUnackedLimitsReason, _EMPTY_)
+		}
+	}
+}
+
+// decStreamPendingLocked updates num pending and redelivery state for a
+// message removed from the stream, and reports whether it was pending.
+// Lock should be held.
+func (o *consumer) decStreamPendingLocked(sseq uint64, subj string) (*Pending, uint64, bool) {
 	// Update our cached num pending only if we think deliverMsg has not done so.
 	if sseq >= o.sseq && o.isFilteredMatch(subj) {
 		o.npc--
@@ -7053,15 +7119,7 @@ func (o *consumer) decStreamPending(sseq uint64, subj string) {
 		// Pass 0 as the delivered sequence to only remove the redelivered state.
 		o.updateAcks(0, sseq, _EMPTY_)
 	}
-
-	o.mu.Unlock()
-
-	// If it was pending process it like an ack.
-	if wasPending {
-		// We could have the lock for the stream so do this in a go routine.
-		// TODO(dlc) - We should do this with ipq vs naked go routines.
-		go o.processTerm(sseq, p.Sequence, rdc, ackTermUnackedLimitsReason, _EMPTY_)
-	}
+	return p, rdc, wasPending
 }
 
 func (o *consumer) account() *Account {

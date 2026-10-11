@@ -12146,3 +12146,87 @@ func TestJetStreamClusterMetaMonitorNotStartedShutdown(t *testing.T) {
 		t.Fatalf("shutdownJetStream took %v", elapsed)
 	}
 }
+
+func TestJetStreamClusterLimitEvictionConsumerPending(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	payload := make([]byte, 100)
+	// The byte limit holds exactly 50 messages, each subject is one byte.
+	msgSize := memStoreMsgSize("a", nil, payload)
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"a", "b"},
+		Storage:  nats.MemoryStorage,
+		Replicas: 3,
+		MaxBytes: int64(50 * msgSize),
+	})
+	require_NoError(t, err)
+
+	for _, cfg := range []*nats.ConsumerConfig{
+		{Durable: "NONE", FilterSubject: "a", AckPolicy: nats.AckNonePolicy},
+		{Durable: "EXPLICIT", FilterSubject: "a", AckPolicy: nats.AckExplicitPolicy, AckWait: time.Hour},
+	} {
+		_, err = js.AddConsumer("TEST", cfg)
+		require_NoError(t, err)
+	}
+
+	// Odd sequences on "a", even on "b". Published async so that committed
+	// entries carry several messages, and so several evictions.
+	publish := func(n int) {
+		t.Helper()
+		for range n / 2 {
+			_, err := js.PublishAsync("a", payload)
+			require_NoError(t, err)
+			_, err = js.PublishAsync("b", payload)
+			require_NoError(t, err)
+		}
+		select {
+		case <-js.PublishAsyncComplete():
+		case <-time.After(5 * time.Second):
+			t.Fatal("did not receive completion signal")
+		}
+	}
+	publish(40)
+
+	// Both consumers get the "a" messages up to stream sequence 19.
+	for _, durable := range []string{"NONE", "EXPLICIT"} {
+		sub, err := js.PullSubscribe("a", durable, nats.Bind("TEST", durable))
+		require_NoError(t, err)
+		msgs := fetchMsgs(t, sub, 10, 5*time.Second)
+		require_Len(t, len(msgs), 10)
+		require_NoError(t, sub.Unsubscribe())
+	}
+
+	// Evicts sequences 1-50: delivered and undelivered "a" messages for both,
+	// and the unacknowledged ones for EXPLICIT.
+	publish(60)
+
+	si, err := js.StreamInfo("TEST")
+	require_NoError(t, err)
+	require_Equal(t, si.State.Msgs, 50)
+	require_Equal(t, si.State.FirstSeq, 51)
+
+	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
+		for _, durable := range []string{"NONE", "EXPLICIT"} {
+			ci, err := js.ConsumerInfo("TEST", durable)
+			if err != nil {
+				return err
+			}
+			// The "a" messages left are sequences 51, 53, ... 99.
+			if ci.NumPending != 25 {
+				return fmt.Errorf("%s: expected 25 pending, got %d", durable, ci.NumPending)
+			}
+			if ci.NumAckPending != 0 {
+				return fmt.Errorf("%s: expected 0 ack pending, got %d", durable, ci.NumAckPending)
+			}
+			if ci.Delivered.Stream != 19 {
+				return fmt.Errorf("%s: expected delivered stream sequence 19, got %d", durable, ci.Delivered.Stream)
+			}
+		}
+		return nil
+	})
+}
