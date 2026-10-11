@@ -1,0 +1,48 @@
+// Copyright 2026 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package server
+
+import (
+	"os"
+	"runtime"
+	"strconv"
+	"time"
+)
+
+// Tuning knobs are read once from NATS_BENCH_* environment variables at
+// startup. Every knob is off when its variable is unset, which keeps the stock
+// behavior.
+
+func benchFlag(key string) bool {
+	return os.Getenv(key) == "1"
+}
+
+func benchDuration(key string) time.Duration {
+	d, _ := time.ParseDuration(os.Getenv(key))
+	return d
+}
+
+func benchUint(key string) uint64 {
+	n, _ := strconv.ParseUint(os.Getenv(key), 10, 64)
+	return n
+}
+
+// NATS_BENCH_LOCK_PROFILE=1 samples mutex contention (1 in 20) and blocking
+// events of 50us or longer, so /debug/pprof/mutex and /block name the locks.
+func init() {
+	if benchFlag("NATS_BENCH_LOCK_PROFILE") {
+		runtime.SetMutexProfileFraction(20)
+		runtime.SetBlockProfileRate(50_000)
+	}
+}
