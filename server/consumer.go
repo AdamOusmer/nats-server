@@ -3079,6 +3079,13 @@ func (o *consumer) propose(entry []byte) {
 
 // Lock should be held.
 func (o *consumer) updateDelivered(dseq, sseq, dc uint64, ts int64) {
+	if o.node != nil && benchAckNoneEvery > 1 && o.cfg.AckPolicy == AckNone && dseq%benchAckNoneEvery != 0 {
+		if o.store != nil {
+			o.store.UpdateDelivered(dseq, sseq, dc, ts)
+		}
+		o.ldt = time.Now()
+		return
+	}
 	// Clustered mode and R>1.
 	if o.node != nil {
 		// Inline for now, use variable compression.

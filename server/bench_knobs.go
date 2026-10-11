@@ -31,6 +31,10 @@ var (
 	// benchProposeCoalesce delays a consumer's proposal forwarder by this
 	// duration after a kick, so one append entry carries more updates.
 	benchProposeCoalesce = benchDuration("NATS_BENCH_PROPOSE_COALESCE")
+	// benchAckNoneEvery replicates an AckNone consumer's delivered cursor
+	// every n deliveries instead of every delivery. A new consumer leader
+	// can resend up to n-1 messages the old one already delivered.
+	benchAckNoneEvery = benchUint("NATS_BENCH_ACKNONE_PROPOSE_EVERY")
 )
 
 func benchFlag(key string) bool {
