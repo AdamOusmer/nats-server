@@ -1757,6 +1757,22 @@ func (c *client) collapsePtoNB() (net.Buffers, int64) {
 	return c.out.nb, c.out.pb
 }
 
+// joinOutbound copies the buffers into one and returns the originals to the
+// pool. A TLS connection has no vectored write, so each buffer would otherwise
+// cost its own record and syscall.
+func joinOutbound(bufs net.Buffers) net.Buffers {
+	var n int
+	for _, buf := range bufs {
+		n += len(buf)
+	}
+	joined := make([]byte, 0, n)
+	for _, buf := range bufs {
+		joined = append(joined, buf...)
+		nbPoolPut(buf)
+	}
+	return append(net.Buffers(nil), joined)
+}
+
 // flushOutbound will flush outbound buffer to a client.
 // Will return true if data was attempted to be written.
 // Lock must be held
@@ -1854,6 +1870,11 @@ func (c *client) flushOutbound() bool {
 		}
 		collapsed = append(net.Buffers(nil), bb.Bytes())
 		attempted = int64(len(collapsed[0]))
+	}
+	if benchTLSCollapse && cw == nil && len(collapsed) > 1 {
+		if _, isTLS := nc.(*tls.Conn); isTLS {
+			collapsed = joinOutbound(collapsed)
+		}
 	}
 
 	// This is safe to do outside of the lock since "collapsed" is no longer

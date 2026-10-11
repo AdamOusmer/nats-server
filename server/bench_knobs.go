@@ -23,6 +23,12 @@ import (
 // Tuning knobs are read once from NATS_BENCH_* environment variables at
 // startup. Every knob is off when its variable is unset, which keeps the stock
 // behavior.
+var (
+	// benchTLSCollapse joins the pending outbound buffers of a TLS connection
+	// into one write, so a flush becomes one TLS record instead of one per
+	// buffer.
+	benchTLSCollapse = benchFlag("NATS_BENCH_TLS_COLLAPSE")
+)
 
 func benchFlag(key string) bool {
 	return os.Getenv(key) == "1"
