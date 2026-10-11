@@ -41,6 +41,9 @@ var (
 	// benchSignalCoalesce signals each consumer once per batch of stored
 	// messages instead of once per message.
 	benchSignalCoalesce = benchFlag("NATS_BENCH_SIGNAL_COALESCE")
+	// benchHdrIndex parses a message's header block once on the ingest and
+	// apply paths instead of scanning it once per header lookup.
+	benchHdrIndex = benchFlag("NATS_BENCH_HDR_INDEX")
 )
 
 func benchFlag(key string) bool {

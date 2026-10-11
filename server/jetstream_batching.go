@@ -540,6 +540,7 @@ func checkMsgHeadersPreClusteredProposal(
 	jsa *jsAccount, allowRollup, denyPurge, allowTTL, allowMsgCounter, allowMsgSchedules bool,
 	discard DiscardPolicy, discardNewPer bool, maxMsgSize int, maxMsgs int64, maxMsgsPer int64, maxBytes int64,
 ) ([]byte, []byte, uint64, *ApiError, error) {
+	hx := indexHeader(hdr)
 	var incr *big.Int
 	var hasSchedule bool
 
@@ -560,7 +561,7 @@ func checkMsgHeadersPreClusteredProposal(
 		// Counter increments.
 		// Only supported on counter streams, and payload must be empty (if not coming from a source).
 		var ok bool
-		if incr, ok = getMessageIncr(hdr); !ok {
+		if incr, ok = getMessageIncri(hdr, &hx); !ok {
 			apiErr := NewJSMessageIncrInvalidError()
 			return hdr, msg, 0, apiErr, apiErr
 		} else if incr != nil && !sourced {
@@ -574,14 +575,14 @@ func checkMsgHeadersPreClusteredProposal(
 			} else {
 				// Check for incompatible headers.
 				var doErr bool
-				if getRollup(hdr) != _EMPTY_ ||
-					getExpectedStream(hdr) != _EMPTY_ ||
-					getExpectedLastMsgId(hdr) != _EMPTY_ ||
-					getExpectedLastSeqPerSubjectForSubject(hdr) != _EMPTY_ {
+				if getRollupi(hdr, &hx) != _EMPTY_ ||
+					getExpectedStreami(hdr, &hx) != _EMPTY_ ||
+					getExpectedLastMsgIdi(hdr, &hx) != _EMPTY_ ||
+					getExpectedLastSeqPerSubjectForSubjecti(hdr, &hx) != _EMPTY_ {
 					doErr = true
-				} else if _, ok = getExpectedLastSeq(hdr); ok {
+				} else if _, ok = getExpectedLastSeqi(hdr, &hx); ok {
 					doErr = true
-				} else if _, ok = getExpectedLastSeqPerSubject(hdr); ok {
+				} else if _, ok = getExpectedLastSeqPerSubjecti(hdr, &hx); ok {
 					doErr = true
 				}
 
@@ -592,11 +593,11 @@ func checkMsgHeadersPreClusteredProposal(
 			}
 		}
 		// Expected stream name can also be pre-checked.
-		if sname := getExpectedStream(hdr); sname != _EMPTY_ && sname != name {
+		if sname := getExpectedStreami(hdr, &hx); sname != _EMPTY_ && sname != name {
 			return hdr, msg, 0, NewJSStreamNotMatchError(), errStreamMismatch
 		}
 		// TTL'd messages are rejected entirely if TTLs are not enabled on the stream, or if the TTL is invalid.
-		if ttl, err := getMessageTTL(hdr); !sourced && (ttl != 0 || err != nil) {
+		if ttl, err := getMessageTTLi(hdr, &hx); !sourced && (ttl != 0 || err != nil) {
 			if !allowTTL {
 				return hdr, msg, 0, NewJSMessageTTLDisabledError(), errMsgTTLDisabled
 			} else if err != nil {
@@ -605,7 +606,7 @@ func checkMsgHeadersPreClusteredProposal(
 		}
 		// Check for MsgIds here at the cluster level to avoid excessive CLFS accounting.
 		// Will help during restarts.
-		if msgId := getMsgId(hdr); msgId != _EMPTY_ {
+		if msgId := getMsgIdi(hdr, &hx); msgId != _EMPTY_ {
 			// Dedupe if staged.
 			if _, ok = diff.msgIds[msgId]; ok {
 				return hdr, msg, 0, NewJSAtomicPublishContainsDuplicateMessageError(), errMsgIdDuplicate
@@ -630,7 +631,7 @@ func checkMsgHeadersPreClusteredProposal(
 		}
 
 		// Non-sourced messages aren't allowed to have the stream source header.
-		if !sourced && len(sliceHeader(JSStreamSource, hdr)) > 0 {
+		if !sourced && len(hx.slice(JSStreamSource, hdr)) > 0 {
 			apiErr := NewJSMessageSourceHdrNotAllowedError()
 			return hdr, msg, 0, apiErr, apiErr
 		}
@@ -678,7 +679,7 @@ func checkMsgHeadersPreClusteredProposal(
 				initial.SetString(val.Value, 10)
 			}
 		}
-		srchdr := sliceHeader(JSStreamSource, hdr)
+		srchdr := hx.slice(JSStreamSource, hdr)
 		if len(srchdr) > 0 {
 			// This is a sourced message, so we can't apply Nats-Incr but
 			// instead should just update the source count header.
@@ -710,6 +711,7 @@ func checkMsgHeadersPreClusteredProposal(
 			previous.SetString(prevVal, 10)
 			incr.Sub(&sourced, &previous)
 			hdr = setHeader(JSMessageIncr, incr.String(), hdr)
+			hx.refresh(hdr)
 		}
 		// Now make the change.
 		initial.Add(&initial, incr)
@@ -723,6 +725,7 @@ func checkMsgHeadersPreClusteredProposal(
 				return hdr, msg, 0, NewJSMessageCounterBrokenError(), err
 			}
 			hdr = setHeader(JSMessageCounterSources, string(nhdr), hdr)
+			hx.refresh(hdr)
 		}
 
 		// Check to see if we are over the max msg size.
@@ -752,7 +755,7 @@ func checkMsgHeadersPreClusteredProposal(
 
 	if len(hdr) > 0 {
 		// Expected last sequence.
-		if seq, exists := getExpectedLastSeq(hdr); exists && seq != mset.clseq-mset.clfs {
+		if seq, exists := getExpectedLastSeqi(hdr, &hx); exists && seq != mset.clseq-mset.clfs {
 			mlseq := mset.clseq - mset.clfs
 			err := fmt.Errorf("last sequence mismatch: %d vs %d", seq, mlseq)
 			return hdr, msg, 0, NewJSStreamWrongLastSequenceError(mlseq), err
@@ -763,10 +766,10 @@ func checkMsgHeadersPreClusteredProposal(
 		}
 
 		// Expected last sequence per subject.
-		if seq, exists := getExpectedLastSeqPerSubject(hdr); exists {
+		if seq, exists := getExpectedLastSeqPerSubjecti(hdr, &hx); exists {
 			// Allow override of the subject used for the check.
 			seqSubj := subject
-			if optSubj := getExpectedLastSeqPerSubjectForSubject(hdr); optSubj != _EMPTY_ {
+			if optSubj := getExpectedLastSeqPerSubjectForSubjecti(hdr, &hx); optSubj != _EMPTY_ {
 				seqSubj = copyString(optSubj)
 			}
 
@@ -820,7 +823,7 @@ func checkMsgHeadersPreClusteredProposal(
 					diff.expectedPerSubject[seqSubj] = e
 				}
 			}
-		} else if getExpectedLastSeqPerSubjectForSubject(hdr) != _EMPTY_ {
+		} else if getExpectedLastSeqPerSubjectForSubjecti(hdr, &hx) != _EMPTY_ {
 			apiErr := NewJSStreamExpectedLastSeqPerSubjectInvalidError()
 			return hdr, msg, 0, apiErr, apiErr
 		}
@@ -828,7 +831,7 @@ func checkMsgHeadersPreClusteredProposal(
 		// Message scheduling.
 		if sourced {
 			// noop, sourced messages were already validated by the origin stream.
-		} else if !hasMessageScheduleHeaders(hdr) {
+		} else if !hasMessageScheduleHeaders(hdr, &hx) {
 			// noop, no schedule to validate.
 		} else if schedule, apiErr := getMessageSchedule(hdr); apiErr != nil {
 			if !allowMsgSchedules {
@@ -840,19 +843,19 @@ func checkMsgHeadersPreClusteredProposal(
 			if !allowMsgSchedules {
 				apiErr := NewJSMessageSchedulesDisabledError()
 				return hdr, msg, 0, apiErr, apiErr
-			} else if scheduleTtl, ok := getMessageScheduleTTL(hdr); !ok {
+			} else if scheduleTtl, ok := getMessageScheduleTTLi(hdr, &hx); !ok {
 				apiErr := NewJSMessageSchedulesTTLInvalidError()
 				return hdr, msg, 0, apiErr, apiErr
-			} else if scheduleRollup := getMessageScheduleRollup(hdr); scheduleRollup != _EMPTY_ && scheduleRollup != JSMsgRollupSubject {
+			} else if scheduleRollup := getMessageScheduleRollupi(hdr, &hx); scheduleRollup != _EMPTY_ && scheduleRollup != JSMsgRollupSubject {
 				apiErr := NewJSMessageSchedulesRollupInvalidError()
 				return hdr, msg, 0, apiErr, apiErr
 			} else if scheduleTtl != _EMPTY_ && !allowTTL {
 				return hdr, msg, 0, NewJSMessageTTLDisabledError(), errMsgTTLDisabled
-			} else if scheduleTarget := getMessageScheduleTarget(hdr); scheduleTarget == _EMPTY_ ||
+			} else if scheduleTarget := getMessageScheduleTargeti(hdr, &hx); scheduleTarget == _EMPTY_ ||
 				!IsValidPublishSubject(scheduleTarget) || scheduleTarget == subject {
 				apiErr := NewJSMessageSchedulesTargetInvalidError()
 				return hdr, msg, 0, apiErr, apiErr
-			} else if scheduleSource := getMessageScheduleSource(hdr); scheduleSource != _EMPTY_ &&
+			} else if scheduleSource := getMessageScheduleSourcei(hdr, &hx); scheduleSource != _EMPTY_ &&
 				(scheduleSource == scheduleTarget || scheduleSource == subject || !IsValidPublishSubject(scheduleSource)) {
 				apiErr := NewJSMessageSchedulesSourceInvalidError()
 				return hdr, msg, 0, apiErr, apiErr
@@ -880,15 +883,16 @@ func checkMsgHeadersPreClusteredProposal(
 
 				// Add a rollup sub header if it doesn't already exist.
 				// Otherwise, it must exist already as a rollup on the subject.
-				if rollup := getRollup(hdr); rollup == _EMPTY_ {
+				if rollup := getRollupi(hdr, &hx); rollup == _EMPTY_ {
 					hdr = genHeader(hdr, JSMsgRollup, JSMsgRollupSubject)
+					hx.refresh(hdr)
 				} else if rollup != JSMsgRollupSubject {
 					apiErr := NewJSMessageSchedulesRollupInvalidError()
 					return hdr, msg, 0, apiErr, apiErr
 				}
 			}
 		}
-		if scheduleNext := sliceHeader(JSScheduleNext, hdr); len(scheduleNext) > 0 && !sourced {
+		if scheduleNext := hx.slice(JSScheduleNext, hdr); len(scheduleNext) > 0 && !sourced {
 			// Clients may only use Nats-Schedule-Next to purge a schedule.
 			if bytesToString(scheduleNext) != JSScheduleNextPurge {
 				apiErr := NewJSMessageSchedulesSchedulerInvalidError()
@@ -897,7 +901,7 @@ func checkMsgHeadersPreClusteredProposal(
 			// Nats-Scheduler must accompany the purge and:
 			// - it must NOT be empty.
 			// - it must NOT match the publish subject.
-			if scheduler := sliceHeader(JSScheduler, hdr); len(scheduler) == 0 ||
+			if scheduler := hx.slice(JSScheduler, hdr); len(scheduler) == 0 ||
 				bytesToString(scheduler) == subject || !IsValidPublishSubject(bytesToString(scheduler)) {
 				apiErr := NewJSMessageSchedulesSchedulerInvalidError()
 				return hdr, msg, 0, apiErr, apiErr
@@ -925,14 +929,14 @@ func checkMsgHeadersPreClusteredProposal(
 					return hdr, msg, 0, apiErr, apiErr
 				}
 			}
-		} else if !sourced && len(sliceHeader(JSScheduler, hdr)) > 0 {
+		} else if !sourced && len(hx.slice(JSScheduler, hdr)) > 0 {
 			// Clients may only use Nats-Scheduler alongside Nats-Schedule-Next.
 			apiErr := NewJSMessageSchedulesSchedulerInvalidError()
 			return hdr, msg, 0, apiErr, apiErr
 		}
 
 		// Check for any rollups.
-		if rollup := getRollup(hdr); rollup != _EMPTY_ {
+		if rollup := getRollupi(hdr, &hx); rollup != _EMPTY_ {
 			if (!allowRollup || denyPurge) && !sourced {
 				err := errors.New("rollup not permitted")
 				return hdr, msg, 0, NewJSStreamRollupFailedError(err), err
@@ -1029,7 +1033,7 @@ func checkMsgHeadersPreClusteredProposal(
 
 		// Similarly, check DiscardNew per-subject threshold to not need to bump CLFS.
 		// Allow rollup messages through since they will purge after storing.
-		if discardNewPer && maxMsgsPer > 0 && len(sliceHeader(JSMsgRollup, hdr)) == 0 {
+		if discardNewPer && maxMsgsPer > 0 && len(hx.slice(JSMsgRollup, hdr)) == 0 {
 			// Get the current total for this subject.
 			totalMsgsForSubject := mset.store.SubjectsTotals(subject)[subject]
 			// Add inflight count in this batch and for this stream.

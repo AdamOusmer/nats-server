@@ -5694,22 +5694,38 @@ func (mset *stream) storeMsgIdLocked(dde *ddentry) {
 
 // Fast lookup of msgId.
 func getMsgId(hdr []byte) string {
-	return string(getHeader(JSMsgId, hdr))
+	return getMsgIdi(hdr, nil)
+}
+
+func getMsgIdi(hdr []byte, hx *hdrIndex) string {
+	return string(hx.slice(JSMsgId, hdr))
 }
 
 // Fast lookup of expected last msgId.
 func getExpectedLastMsgId(hdr []byte) string {
-	return string(getHeader(JSExpectedLastMsgId, hdr))
+	return getExpectedLastMsgIdi(hdr, nil)
+}
+
+func getExpectedLastMsgIdi(hdr []byte, hx *hdrIndex) string {
+	return string(hx.slice(JSExpectedLastMsgId, hdr))
 }
 
 // Fast lookup of expected stream.
 func getExpectedStream(hdr []byte) string {
-	return string(getHeader(JSExpectedStream, hdr))
+	return getExpectedStreami(hdr, nil)
+}
+
+func getExpectedStreami(hdr []byte, hx *hdrIndex) string {
+	return string(hx.slice(JSExpectedStream, hdr))
 }
 
 // Fast lookup of expected last sequence.
 func getExpectedLastSeq(hdr []byte) (uint64, bool) {
-	bseq := sliceHeader(JSExpectedLastSeq, hdr)
+	return getExpectedLastSeqi(hdr, nil)
+}
+
+func getExpectedLastSeqi(hdr []byte, hx *hdrIndex) (uint64, bool) {
+	bseq := hx.slice(JSExpectedLastSeq, hdr)
 	if len(bseq) == 0 {
 		return 0, false
 	}
@@ -5718,7 +5734,11 @@ func getExpectedLastSeq(hdr []byte) (uint64, bool) {
 
 // Fast lookup of rollups.
 func getRollup(hdr []byte) string {
-	r := getHeader(JSMsgRollup, hdr)
+	return getRollupi(hdr, nil)
+}
+
+func getRollupi(hdr []byte, hx *hdrIndex) string {
+	r := hx.slice(JSMsgRollup, hdr)
 	if len(r) == 0 {
 		return _EMPTY_
 	}
@@ -5727,7 +5747,11 @@ func getRollup(hdr []byte) string {
 
 // Fast lookup of expected stream sequence per subject.
 func getExpectedLastSeqPerSubject(hdr []byte) (uint64, bool) {
-	bseq := sliceHeader(JSExpectedLastSubjSeq, hdr)
+	return getExpectedLastSeqPerSubjecti(hdr, nil)
+}
+
+func getExpectedLastSeqPerSubjecti(hdr []byte, hx *hdrIndex) (uint64, bool) {
+	bseq := hx.slice(JSExpectedLastSubjSeq, hdr)
 	if len(bseq) == 0 {
 		return 0, false
 	}
@@ -5736,7 +5760,11 @@ func getExpectedLastSeqPerSubject(hdr []byte) (uint64, bool) {
 
 // Fast lookup of expected subject for the expected stream sequence per subject.
 func getExpectedLastSeqPerSubjectForSubject(hdr []byte) string {
-	return bytesToString(sliceHeader(JSExpectedLastSubjSeqSubj, hdr))
+	return getExpectedLastSeqPerSubjectForSubjecti(hdr, nil)
+}
+
+func getExpectedLastSeqPerSubjectForSubjecti(hdr []byte, hx *hdrIndex) string {
+	return bytesToString(hx.slice(JSExpectedLastSubjSeqSubj, hdr))
 }
 
 // Fast lookup of the message TTL from headers:
@@ -5744,7 +5772,11 @@ func getExpectedLastSeqPerSubjectForSubject(hdr []byte) string {
 // - Zero return value: no TTL or parse error.
 // - Negative return value: never expires.
 func getMessageTTL(hdr []byte) (int64, error) {
-	ttl := getHeader(JSMessageTTL, hdr)
+	return getMessageTTLi(hdr, nil)
+}
+
+func getMessageTTLi(hdr []byte, hx *hdrIndex) (int64, error) {
+	ttl := hx.slice(JSMessageTTL, hdr)
 	if len(ttl) == 0 {
 		return 0, nil
 	}
@@ -5779,7 +5811,11 @@ func parseMessageTTL(ttl string) (int64, error) {
 // Fast lookup of the message Incr from headers.
 // Return includes the value or nil, and success.
 func getMessageIncr(hdr []byte) (*big.Int, bool) {
-	incr := sliceHeader(JSMessageIncr, hdr)
+	return getMessageIncri(hdr, nil)
+}
+
+func getMessageIncri(hdr []byte, hx *hdrIndex) (*big.Int, bool) {
+	incr := hx.slice(JSMessageIncr, hdr)
 	if len(incr) == 0 {
 		return nil, true
 	}
@@ -5789,8 +5825,8 @@ func getMessageIncr(hdr []byte) (*big.Int, bool) {
 
 // hasMessageScheduleHeaders reports whether hdr carries a schedule pattern or
 // time zone. Without either, getMessageSchedule returns no schedule and no error.
-func hasMessageScheduleHeaders(hdr []byte) bool {
-	return len(sliceHeader(JSSchedulePattern, hdr)) > 0 || sliceHeader(JSScheduleTimeZone, hdr) != nil
+func hasMessageScheduleHeaders(hdr []byte, hx *hdrIndex) bool {
+	return len(hx.slice(JSSchedulePattern, hdr)) > 0 || hx.slice(JSScheduleTimeZone, hdr) != nil
 }
 
 // Fast lookup of message schedule.
@@ -5839,7 +5875,11 @@ func loadMessageScheduleLocation(hdr []byte) (*time.Location, *ApiError) {
 // Fast lookup of the message schedule TTL from headers.
 // The TTL is confirmed to be valid, but the raw TTL string is returned.
 func getMessageScheduleTTL(hdr []byte) (string, bool) {
-	ttl := getHeader(JSScheduleTTL, hdr)
+	return getMessageScheduleTTLi(hdr, nil)
+}
+
+func getMessageScheduleTTLi(hdr []byte, hx *hdrIndex) (string, bool) {
+	ttl := hx.slice(JSScheduleTTL, hdr)
 	if len(ttl) == 0 {
 		return _EMPTY_, true
 	}
@@ -5851,31 +5891,47 @@ func getMessageScheduleTTL(hdr []byte) (string, bool) {
 
 // Fast lookup of the message schedule rollup from headers.
 func getMessageScheduleRollup(hdr []byte) string {
-	return string(sliceHeader(JSScheduleRollup, hdr))
+	return getMessageScheduleRollupi(hdr, nil)
+}
+
+func getMessageScheduleRollupi(hdr []byte, hx *hdrIndex) string {
+	return string(hx.slice(JSScheduleRollup, hdr))
 }
 
 // Fast lookup of message schedule target.
 func getMessageScheduleTarget(hdr []byte) string {
+	return getMessageScheduleTargeti(hdr, nil)
+}
+
+func getMessageScheduleTargeti(hdr []byte, hx *hdrIndex) string {
 	if len(hdr) == 0 {
 		return _EMPTY_
 	}
-	return string(getHeader(JSScheduleTarget, hdr))
+	return string(hx.slice(JSScheduleTarget, hdr))
 }
 
 // Fast lookup of message schedule source.
 func getMessageScheduleSource(hdr []byte) string {
+	return getMessageScheduleSourcei(hdr, nil)
+}
+
+func getMessageScheduleSourcei(hdr []byte, hx *hdrIndex) string {
 	if len(hdr) == 0 {
 		return _EMPTY_
 	}
-	return string(getHeader(JSScheduleSource, hdr))
+	return string(hx.slice(JSScheduleSource, hdr))
 }
 
 // Fast lookup of message scheduler.
 func getMessageScheduler(hdr []byte) string {
+	return getMessageScheduleri(hdr, nil)
+}
+
+func getMessageScheduleri(hdr []byte, hx *hdrIndex) string {
 	if len(hdr) == 0 {
 		return _EMPTY_
 	}
-	return string(getHeader(JSScheduler, hdr))
+	return string(hx.slice(JSScheduler, hdr))
 }
 
 // Fast lookup of batch ID.
@@ -6029,7 +6085,11 @@ func getFastBatch(reply string, hdr []byte) (*FastBatch, bool) {
 
 // Fast lookup of batch sequence.
 func getBatchSequence(hdr []byte) (uint64, bool) {
-	bseq := sliceHeader(JSBatchSeq, hdr)
+	return getBatchSequencei(hdr, nil)
+}
+
+func getBatchSequencei(hdr []byte, hx *hdrIndex) (uint64, bool) {
+	bseq := hx.slice(JSBatchSeq, hdr)
 	if len(bseq) == 0 {
 		return 0, false
 	}
@@ -6503,6 +6563,7 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 }
 
 func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg []byte, lseq uint64, ts int64, mt *msgTrace, sourced bool, needIsolation bool, fastBatch *FastBatch, deferResponse bool) (retErr error) {
+	hx := indexHeader(hdr)
 	if mt != nil && !deferResponse {
 		// Only the leader/standalone will have mt!=nil. On exit, send the
 		// message trace event.
@@ -6597,8 +6658,9 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		canConsistencyCheck = traceOnly
 	}
 	if len(hdr) > 0 && batchId == _EMPTY_ {
-		if batchId = getBatchId(hdr); batchId != _EMPTY_ {
-			batchSeq, _ = getBatchSequence(hdr)
+		if bid := hx.slice(JSBatchId, hdr); len(bid) > 0 {
+			batchId = string(bid)
+			batchSeq, _ = getBatchSequencei(hdr, &hx)
 			// Disable consistency checking if this was already done
 			// earlier as part of the batch consistency check.
 			canConsistencyCheck = traceOnly
@@ -6660,6 +6722,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	// For now remove. TODO(dlc) - Should this be opt-in or opt-out?
 	if len(hdr) > 0 {
 		hdr = removeHeaderIfPresent(hdr, ClientInfoHdr)
+		hx.refresh(hdr)
 	}
 
 	// Process additional msg headers if still present.
@@ -6697,7 +6760,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			// Counter increments.
 			// Only supported on counter streams, and payload must be empty (if not coming from a source).
 			var ok bool
-			if incr, ok = getMessageIncr(hdr); !ok {
+			if incr, ok = getMessageIncri(hdr, &hx); !ok {
 				apiErr := NewJSMessageIncrInvalidError()
 				if canRespond {
 					resp.PubAck = &PubAck{Stream: name}
@@ -6729,14 +6792,14 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				} else {
 					// Check for incompatible headers.
 					var doErr bool
-					if getRollup(hdr) != _EMPTY_ ||
-						getExpectedStream(hdr) != _EMPTY_ ||
-						getExpectedLastMsgId(hdr) != _EMPTY_ ||
-						getExpectedLastSeqPerSubjectForSubject(hdr) != _EMPTY_ {
+					if getRollupi(hdr, &hx) != _EMPTY_ ||
+						getExpectedStreami(hdr, &hx) != _EMPTY_ ||
+						getExpectedLastMsgIdi(hdr, &hx) != _EMPTY_ ||
+						getExpectedLastSeqPerSubjectForSubjecti(hdr, &hx) != _EMPTY_ {
 						doErr = true
-					} else if _, ok := getExpectedLastSeq(hdr); ok {
+					} else if _, ok := getExpectedLastSeqi(hdr, &hx); ok {
 						doErr = true
-					} else if _, ok := getExpectedLastSeqPerSubject(hdr); ok {
+					} else if _, ok := getExpectedLastSeqPerSubjecti(hdr, &hx); ok {
 						doErr = true
 					}
 
@@ -6754,7 +6817,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			}
 
 			// Expected stream.
-			if sname := getExpectedStream(hdr); sname != _EMPTY_ && sname != name {
+			if sname := getExpectedStreami(hdr, &hx); sname != _EMPTY_ && sname != name {
 				if canRespond {
 					resp.PubAck = &PubAck{Stream: name}
 					resp.Error = NewJSStreamNotMatchError()
@@ -6767,7 +6830,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			// TTL'd messages are rejected entirely if TTLs are not enabled on the stream.
 			// Shouldn't happen in clustered mode since we should have already caught this
 			// in processClusteredInboundMsg, but needed here for non-clustered etc.
-			if ttl, _ := getMessageTTL(hdr); !sourced && ttl != 0 && !mset.cfg.AllowMsgTTL {
+			if ttl, _ := getMessageTTLi(hdr, &hx); !sourced && ttl != 0 && !mset.cfg.AllowMsgTTL {
 				if canRespond {
 					resp.PubAck = &PubAck{Stream: name}
 					resp.Error = NewJSMessageTTLDisabledError()
@@ -6778,10 +6841,10 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			}
 
 			// Expected last sequence per subject.
-			if seq, exists := getExpectedLastSeqPerSubject(hdr); exists {
+			if seq, exists := getExpectedLastSeqPerSubjecti(hdr, &hx); exists {
 				// Allow override of the subject used for the check.
 				seqSubj := subject
-				if optSubj := getExpectedLastSeqPerSubjectForSubject(hdr); optSubj != _EMPTY_ {
+				if optSubj := getExpectedLastSeqPerSubjectForSubjecti(hdr, &hx); optSubj != _EMPTY_ {
 					seqSubj = optSubj
 				}
 
@@ -6804,7 +6867,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					}
 					return fmt.Errorf("last sequence by subject mismatch: %d vs %d", seq, fseq)
 				}
-			} else if getExpectedLastSeqPerSubjectForSubject(hdr) != _EMPTY_ {
+			} else if getExpectedLastSeqPerSubjectForSubjecti(hdr, &hx) != _EMPTY_ {
 				apiErr := NewJSStreamExpectedLastSeqPerSubjectInvalidError()
 				if canRespond {
 					resp.PubAck = &PubAck{Stream: name}
@@ -6816,7 +6879,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			}
 
 			// Expected last sequence.
-			if seq, exists := getExpectedLastSeq(hdr); exists && seq != mset.lseq {
+			if seq, exists := getExpectedLastSeqi(hdr, &hx); exists && seq != mset.lseq {
 				mlseq := mset.lseq
 				if canRespond {
 					resp.PubAck = &PubAck{Stream: name}
@@ -6830,7 +6893,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			// Message scheduling.
 			if sourced {
 				// noop, sourced messages were already validated by the origin stream.
-			} else if !hasMessageScheduleHeaders(hdr) {
+			} else if !hasMessageScheduleHeaders(hdr, &hx) {
 				// noop, no schedule to validate.
 			} else if schedule, apiErr := getMessageSchedule(hdr); apiErr != nil {
 				if !allowMsgSchedules {
@@ -6853,7 +6916,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 						outq.sendMsg(reply, b)
 					}
 					return apiErr
-				} else if scheduleTtl, ok := getMessageScheduleTTL(hdr); !ok {
+				} else if scheduleTtl, ok := getMessageScheduleTTLi(hdr, &hx); !ok {
 					apiErr := NewJSMessageSchedulesTTLInvalidError()
 					if canRespond {
 						resp.PubAck = &PubAck{Stream: name}
@@ -6862,7 +6925,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 						outq.sendMsg(reply, b)
 					}
 					return apiErr
-				} else if scheduleRollup := getMessageScheduleRollup(hdr); scheduleRollup != _EMPTY_ && scheduleRollup != JSMsgRollupSubject {
+				} else if scheduleRollup := getMessageScheduleRollupi(hdr, &hx); scheduleRollup != _EMPTY_ && scheduleRollup != JSMsgRollupSubject {
 					apiErr := NewJSMessageSchedulesRollupInvalidError()
 					if canRespond {
 						resp.PubAck = &PubAck{Stream: name}
@@ -6879,7 +6942,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 						outq.sendMsg(reply, b)
 					}
 					return errMsgTTLDisabled
-				} else if scheduleTarget := getMessageScheduleTarget(hdr); scheduleTarget == _EMPTY_ ||
+				} else if scheduleTarget := getMessageScheduleTargeti(hdr, &hx); scheduleTarget == _EMPTY_ ||
 					!IsValidPublishSubject(scheduleTarget) || scheduleTarget == subject {
 					apiErr := NewJSMessageSchedulesTargetInvalidError()
 					if canRespond {
@@ -6889,7 +6952,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 						outq.sendMsg(reply, b)
 					}
 					return apiErr
-				} else if scheduleSource := getMessageScheduleSource(hdr); scheduleSource != _EMPTY_ &&
+				} else if scheduleSource := getMessageScheduleSourcei(hdr, &hx); scheduleSource != _EMPTY_ &&
 					(scheduleSource == scheduleTarget || scheduleSource == subject || !IsValidPublishSubject(scheduleSource)) {
 					apiErr := NewJSMessageSchedulesSourceInvalidError()
 					if canRespond {
@@ -6931,8 +6994,9 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 
 					// Add a rollup sub header if it doesn't already exist.
 					// Otherwise, it must exist already as a rollup on the subject.
-					if rollup := getRollup(hdr); rollup == _EMPTY_ {
+					if rollup := getRollupi(hdr, &hx); rollup == _EMPTY_ {
 						hdr = genHeader(hdr, JSMsgRollup, JSMsgRollupSubject)
+						hx.refresh(hdr)
 					} else if rollup != JSMsgRollupSubject {
 						apiErr := NewJSMessageSchedulesRollupInvalidError()
 						if canRespond {
@@ -6945,7 +7009,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 					}
 				}
 			}
-			if scheduleNext := sliceHeader(JSScheduleNext, hdr); len(scheduleNext) > 0 && !sourced {
+			if scheduleNext := hx.slice(JSScheduleNext, hdr); len(scheduleNext) > 0 && !sourced {
 				// Clients may only use Nats-Schedule-Next to purge a schedule.
 				if bytesToString(scheduleNext) != JSScheduleNextPurge {
 					apiErr := NewJSMessageSchedulesSchedulerInvalidError()
@@ -6960,7 +7024,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				// Nats-Scheduler must accompany the purge and:
 				// - it must NOT be empty.
 				// - it must NOT match the publish subject.
-				if scheduler := sliceHeader(JSScheduler, hdr); len(scheduler) == 0 ||
+				if scheduler := hx.slice(JSScheduler, hdr); len(scheduler) == 0 ||
 					bytesToString(scheduler) == subject || !IsValidPublishSubject(bytesToString(scheduler)) {
 					apiErr := NewJSMessageSchedulesSchedulerInvalidError()
 					if canRespond {
@@ -6997,7 +7061,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 						return apiErr
 					}
 				}
-			} else if !sourced && len(sliceHeader(JSScheduler, hdr)) > 0 {
+			} else if !sourced && len(hx.slice(JSScheduler, hdr)) > 0 {
 				// Clients may only use Nats-Scheduler alongside Nats-Schedule-Next.
 				apiErr := NewJSMessageSchedulesSchedulerInvalidError()
 				if canRespond {
@@ -7010,7 +7074,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			}
 
 			// Non-sourced messages aren't allowed to have the stream source header.
-			if !sourced && len(sliceHeader(JSStreamSource, hdr)) > 0 {
+			if !sourced && len(hx.slice(JSStreamSource, hdr)) > 0 {
 				apiErr := NewJSMessageSourceHdrNotAllowedError()
 				if canRespond {
 					resp.PubAck = &PubAck{Stream: name}
@@ -7024,7 +7088,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 
 		// Dedupe detection. This is done at the cluster level for dedupe detection above the
 		// lower layers. But we still need to pull out the msgId.
-		if msgId = getMsgId(hdr); msgId != _EMPTY_ {
+		if msgId = getMsgIdi(hdr, &hx); msgId != _EMPTY_ {
 			// Do real check only if not clustered or traceOnly flag is set.
 			// If we're mirroring we can't deduplicate on our own.
 			if canConsistencyCheck && !isMirror {
@@ -7047,7 +7111,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		}
 
 		// Expected last msgId.
-		if lmsgId := getExpectedLastMsgId(hdr); lmsgId != _EMPTY_ {
+		if lmsgId := getExpectedLastMsgIdi(hdr, &hx); lmsgId != _EMPTY_ {
 			if lmsgId != mset.lmsgId {
 				last := mset.lmsgId
 				bumpCLFS()
@@ -7061,7 +7125,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			}
 		}
 		// Check for any rollups.
-		if rollup := getRollup(hdr); rollup != _EMPTY_ {
+		if rollup := getRollupi(hdr, &hx); rollup != _EMPTY_ {
 			if canConsistencyCheck && !allowRollupPurge && !sourced {
 				err := errors.New("rollup not permitted")
 				if canRespond {
@@ -7144,7 +7208,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			}
 			initial.SetString(val.Value, 10)
 		}
-		srchdr := sliceHeader(JSStreamSource, hdr)
+		srchdr := hx.slice(JSStreamSource, hdr)
 		if len(srchdr) > 0 {
 			// This is a sourced message, so we can't apply Nats-Incr but
 			// instead should just update the source count header.
@@ -7182,6 +7246,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			previous.SetString(prevVal, 10)
 			incr.Sub(&sourced, &previous)
 			hdr = setHeader(JSMessageIncr, incr.String(), hdr)
+			hx.refresh(hdr)
 		}
 		// Now make the change.
 		initial.Add(&initial, incr)
@@ -7201,6 +7266,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 				return err
 			}
 			hdr = setHeader(JSMessageCounterSources, string(nhdr), hdr)
+			hx.refresh(hdr)
 		}
 
 		// Check to see if we are over the max msg size.
@@ -7361,7 +7427,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 	}
 
 	// Find the message TTL if any.
-	ttl, err := getMessageTTL(hdr)
+	ttl, err := getMessageTTLi(hdr, &hx)
 	if err != nil {
 		if canRespond {
 			resp.PubAck = &PubAck{Stream: name}
@@ -7379,7 +7445,9 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		if minTtl := int64(mset.cfg.SubjectDeleteMarkerTTL.Seconds()); ttl < minTtl {
 			ttl = minTtl
 			hdr = removeHeaderIfPresent(hdr, JSMessageTTL)
+			hx.refresh(hdr)
 			hdr = genHeader(hdr, JSMessageTTL, strconv.FormatInt(ttl, 10))
+			hx.refresh(hdr)
 		}
 	}
 
@@ -7563,6 +7631,7 @@ func (mset *stream) processJetStreamMsgWithRollup(subject string, rollupSub, rol
 // processJetStreamAtomicBatchMsg processes a JetStream message that's part of an atomic batch publish.
 // Handles constraints around the batch, storing messages, doing consistency checks, and performing the commit.
 func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply string, hdr, msg []byte, mt *msgTrace) (retErr error) {
+	hx := indexHeader(hdr)
 	mset.mu.RLock()
 	canRespond := !mset.cfg.NoAck && len(reply) > 0
 	name, stype := mset.cfg.Name, mset.cfg.Storage
@@ -7639,7 +7708,7 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 		return respondError(NewJSAtomicPublishInvalidBatchIDError())
 	}
 
-	batchSeq, exists := getBatchSequence(hdr)
+	batchSeq, exists := getBatchSequencei(hdr, &hx)
 	if !exists {
 		return respondError(NewJSAtomicPublishMissingSeqError())
 	}
@@ -7650,7 +7719,7 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 
 	// Parse the batch commit header.
 	var commit, commitEob, commitInvalid bool
-	if c := sliceHeader(JSBatchCommit, hdr); c != nil {
+	if c := hx.slice(JSBatchCommit, hdr); c != nil {
 		commitEob = bytes.Equal(c, []byte("eob"))
 		commitInvalid = !commitEob && !bytes.Equal(c, []byte("1"))
 		commit = true
@@ -7750,7 +7819,7 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 	}
 
 	// The required API level can have the batch be rejected. But the header is always removed.
-	if len(sliceHeader(JSRequiredApiLevel, hdr)) != 0 {
+	if len(hx.slice(JSRequiredApiLevel, hdr)) != 0 {
 		if errorOnRequiredApiLevel(hdr) {
 			b.cleanupLocked(batchId, batches)
 			batches.mu.Unlock()
@@ -7760,6 +7829,7 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 			return respondError(err)
 		}
 		hdr = removeHeaderIfPresent(hdr, JSRequiredApiLevel)
+		hx.refresh(hdr)
 	}
 
 	// If cleanup has already happened, we can't continue.
