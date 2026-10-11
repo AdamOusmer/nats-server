@@ -50,6 +50,9 @@ var (
 	// benchRingIndex indexes memory store messages in a ring by sequence
 	// instead of a map.
 	benchRingIndex = benchFlag("NATS_BENCH_RING_INDEX")
+	// benchEvictBatch evicts for a memory store's byte limit as one run from
+	// the head, n messages past the limit, reported in one callback.
+	benchEvictBatch = int(benchUint("NATS_BENCH_EVICT_BATCH"))
 )
 
 func benchFlag(key string) bool {

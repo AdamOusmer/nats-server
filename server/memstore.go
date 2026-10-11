@@ -53,6 +53,8 @@ type memStore struct {
 	scheduling  *MsgScheduling
 	sdm         *SDMMeta
 	sources     map[string]*StreamSourceState
+	evictMsgs   int64 // Evicted by evictHeadBatchLocked, not yet reported.
+	evictBytes  int64
 }
 
 func newMemStore(cfg *StreamConfig) (*memStore, error) {
@@ -185,8 +187,13 @@ func (ms *memStore) UpdateConfig(cfg *StreamConfig) error {
 			return true
 		})
 	}
+	cb := ms.scb
+	em, eb := ms.takeEvictedLocked()
 	ms.mu.Unlock()
 
+	if em > 0 && cb != nil {
+		cb(-em, -eb, 0, _EMPTY_)
+	}
 	if cfg.MaxAge != 0 || cfg.AllowMsgTTL {
 		ms.expireMsgs()
 	}
@@ -394,8 +401,12 @@ func (ms *memStore) StoreRawMsg(subj string, hdr, msg []byte, seq uint64, ts, tt
 		// Calculate duration when the next expireMsgs should be called.
 		ms.resetAgeChk(int64(time.Millisecond) * 50)
 	}
+	em, eb := ms.takeEvictedLocked()
 	ms.mu.Unlock()
 
+	if em > 0 && cb != nil {
+		cb(-em, -eb, 0, _EMPTY_)
+	}
 	if err == nil && cb != nil {
 		cb(1, int64(memStoreMsgSize(subj, hdr, msg)), seq, subj)
 	}
@@ -410,7 +421,11 @@ func (ms *memStore) StoreMsg(subj string, hdr, msg []byte, ttl int64) (uint64, i
 	// This is called for a R1 with no expected sequence number, so perform DiscardNew checks on the store-level.
 	err := ms.storeRawMsg(subj, hdr, msg, seq, ts, ttl, true)
 	cb := ms.scb
+	em, eb := ms.takeEvictedLocked()
 	ms.mu.Unlock()
+	if em > 0 && cb != nil {
+		cb(-em, -eb, 0, _EMPTY_)
+	}
 
 	if err != nil {
 		seq, ts = 0, 0
@@ -1258,9 +1273,72 @@ func (ms *memStore) enforceBytesLimit() {
 	if ms.cfg.MaxBytes <= 0 || ms.state.Bytes <= uint64(ms.cfg.MaxBytes) {
 		return
 	}
+	if benchEvictBatch > 0 && ms.ttls == nil && ms.scheduling == nil {
+		ms.evictHeadBatchLocked()
+		return
+	}
 	for bs := ms.state.Bytes; bs > uint64(ms.cfg.MaxBytes); bs = ms.state.Bytes {
 		ms.deleteFirstMsgOrPanic()
 	}
+}
+
+// evictHeadBatchLocked removes the oldest messages until the store is under
+// MaxBytes and then benchEvictBatch more, so the next appends do not evict.
+// The per-message path drops the lock for the storage callback on every
+// removal and churns dmap; here the removals are counted and reported in one
+// callback by the caller after unlocking (see takeEvictedLocked). Consumers
+// then recompute their pending counts once, as after a purge.
+// Lock should be held.
+func (ms *memStore) evictHeadBatchLocked() {
+	extra, limit := benchEvictBatch, uint64(ms.cfg.MaxBytes)
+	var n, bytes uint64
+	oldFirst, last := ms.state.FirstSeq, ms.state.LastSeq
+	seq := oldFirst
+	for ; seq <= last; seq++ {
+		sm, ok := ms.idxget(seq)
+		if !ok {
+			continue
+		}
+		if ms.state.Bytes <= limit {
+			// Under the limit, never trim the message just stored.
+			if extra <= 0 || seq == last {
+				break
+			}
+			extra--
+		}
+		size := min(memStoreMsgSize(sm.subj, sm.hdr, sm.msg), ms.state.Bytes)
+		if ms.state.Msgs > 0 {
+			ms.state.Msgs--
+		}
+		ms.state.Bytes -= size
+		bytes += size
+		n++
+		ms.removeSeqPerSubject(sm.subj, seq)
+		ms.idxdel(seq)
+	}
+	var nsm *StoreMsg
+	for ; seq <= last && nsm == nil; seq++ {
+		nsm = ms.idxget1(seq)
+	}
+	if nsm != nil {
+		ms.state.FirstSeq, ms.state.FirstTime = nsm.seq, time.Unix(0, nsm.ts).UTC()
+	} else {
+		ms.state.FirstSeq, ms.state.FirstTime = ms.state.LastSeq+1, time.Time{}
+	}
+	for s := oldFirst; s < ms.state.FirstSeq; s++ {
+		ms.dmap.Delete(s)
+	}
+	ms.evictMsgs += int64(n)
+	ms.evictBytes += int64(bytes)
+}
+
+// takeEvictedLocked returns and clears what evictHeadBatchLocked removed
+// since the last call, for the caller to report once unlocked.
+// Lock should be held.
+func (ms *memStore) takeEvictedLocked() (int64, int64) {
+	n, b := ms.evictMsgs, ms.evictBytes
+	ms.evictMsgs, ms.evictBytes = 0, 0
+	return n, b
 }
 
 // Will start the age check timer.
