@@ -53,6 +53,8 @@ var (
 	// benchEvictBatch evicts for a memory store's byte limit as one run from
 	// the head, n messages past the limit, reported in one callback.
 	benchEvictBatch = int(benchUint("NATS_BENCH_EVICT_BATCH"))
+	// benchStoreSlab allocates memory store messages from shared slabs.
+	benchStoreSlab = benchFlag("NATS_BENCH_STORE_SLAB")
 )
 
 func benchFlag(key string) bool {

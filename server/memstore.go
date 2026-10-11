@@ -55,6 +55,8 @@ type memStore struct {
 	sources     map[string]*StreamSourceState
 	evictMsgs   int64 // Evicted by evictHeadBatchLocked, not yet reported.
 	evictBytes  int64
+	slabMsgs    []StoreMsg // Unused StoreMsg headers of the current slab.
+	slabBuf     []byte     // Unused bytes of the current buffer slab.
 }
 
 func newMemStore(cfg *StreamConfig) (*memStore, error) {
@@ -313,7 +315,7 @@ func (ms *memStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, tt
 	}
 
 	// FIXME(dlc) - Could pool at this level?
-	sm := &StoreMsg{subj, nil, nil, make([]byte, 0, len(hdr)+len(msg)), seq, ts}
+	sm := ms.newStoreMsg(subj, len(hdr)+len(msg), seq, ts)
 	sm.buf = append(sm.buf, hdr...)
 	sm.buf = append(sm.buf, msg...)
 	if len(hdr) > 0 {
