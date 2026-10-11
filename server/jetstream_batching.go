@@ -828,6 +828,8 @@ func checkMsgHeadersPreClusteredProposal(
 		// Message scheduling.
 		if sourced {
 			// noop, sourced messages were already validated by the origin stream.
+		} else if !hasMessageScheduleHeaders(hdr) {
+			// noop, no schedule to validate.
 		} else if schedule, apiErr := getMessageSchedule(hdr); apiErr != nil {
 			if !allowMsgSchedules {
 				apiErr = NewJSMessageSchedulesDisabledError()

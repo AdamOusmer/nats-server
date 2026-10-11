@@ -5787,6 +5787,12 @@ func getMessageIncr(hdr []byte) (*big.Int, bool) {
 	return v.SetString(bytesToString(incr), 10)
 }
 
+// hasMessageScheduleHeaders reports whether hdr carries a schedule pattern or
+// time zone. Without either, getMessageSchedule returns no schedule and no error.
+func hasMessageScheduleHeaders(hdr []byte) bool {
+	return len(sliceHeader(JSSchedulePattern, hdr)) > 0 || sliceHeader(JSScheduleTimeZone, hdr) != nil
+}
+
 // Fast lookup of message schedule.
 func getMessageSchedule(hdr []byte) (time.Time, *ApiError) {
 	if len(hdr) == 0 {
@@ -6824,6 +6830,8 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 			// Message scheduling.
 			if sourced {
 				// noop, sourced messages were already validated by the origin stream.
+			} else if !hasMessageScheduleHeaders(hdr) {
+				// noop, no schedule to validate.
 			} else if schedule, apiErr := getMessageSchedule(hdr); apiErr != nil {
 				if !allowMsgSchedules {
 					apiErr = NewJSMessageSchedulesDisabledError()
