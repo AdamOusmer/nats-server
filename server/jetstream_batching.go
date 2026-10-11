@@ -45,6 +45,61 @@ type atomicBatch struct {
 	timer *time.Timer // Inactivity timer for the batch.
 	lseq  uint64      // The highest sequence for this batch.
 	store StreamStore // Where the batch is staged before committing.
+	arena []stagedMsg // Replaces store when staging in memory with NATS_BENCH_STAGE_ARENA.
+}
+
+// stagedMsg is one message of an arena-staged batch; batch sequence n is arena[n-1].
+type stagedMsg struct {
+	subj string
+	hdr  []byte
+	msg  []byte
+}
+
+func (b *atomicBatch) storageType() StorageType {
+	if b.store == nil {
+		return MemoryStorage
+	}
+	return b.store.Type()
+}
+
+// stagedCount is how many messages the batch holds, whichever way it stages.
+func (b *atomicBatch) stagedCount() uint64 {
+	if b.store == nil {
+		return uint64(len(b.arena))
+	}
+	var st StreamState
+	b.store.FastState(&st)
+	return st.Msgs
+}
+
+// stageMsg stages one batch message and returns its batch sequence.
+func (b *atomicBatch) stageMsg(subject string, hdr, msg []byte) (uint64, error) {
+	if b.store != nil {
+		seq, _, err := b.store.StoreMsg(subject, hdr, msg, 0)
+		return seq, err
+	}
+	buf := make([]byte, 0, len(hdr)+len(msg))
+	buf = append(buf, hdr...)
+	buf = append(buf, msg...)
+	sm := stagedMsg{subj: subject, msg: buf[len(hdr):]}
+	if len(hdr) > 0 {
+		sm.hdr = buf[:len(hdr):len(hdr)]
+	}
+	b.arena = append(b.arena, sm)
+	return uint64(len(b.arena)), nil
+}
+
+// loadStaged reads one staged message back for the commit pass.
+func (b *atomicBatch) loadStaged(seq uint64, smv *StoreMsg) (*StoreMsg, error) {
+	if b.store != nil {
+		return b.store.LoadMsg(seq, smv)
+	}
+	if seq == 0 || seq > uint64(len(b.arena)) {
+		return nil, ErrStoreMsgNotFound
+	}
+	st := &b.arena[seq-1]
+	smv.subj, smv.hdr, smv.msg, smv.seq = st.subj, st.hdr, st.msg, seq
+	return smv, nil
 }
 
 type fastBatch struct {
@@ -64,6 +119,11 @@ type fastBatch struct {
 // newAtomicBatch creates an atomic batch publish object.
 // Lock should be held.
 func (batches *batching) newAtomicBatch(mset *stream, batchId string, replicas int, storage StorageType, storeDir, streamName string) (*atomicBatch, error) {
+	if benchStageArena && !(replicas == 1 && storage == FileStorage) {
+		b := &atomicBatch{arena: make([]stagedMsg, 0, 64)}
+		b.setupCleanupTimer(mset, batchId, batches)
+		return b, nil
+	}
 	store, err := newBatchStore(mset, batchId, replicas, storage, storeDir, streamName)
 	if err != nil {
 		return nil, err
@@ -104,7 +164,10 @@ func (b *atomicBatch) cleanupLocked(batchId string, batches *batching) {
 	}
 	globalInflightAtomicBatches.Add(-1)
 	b.timer.Stop()
-	b.store.Delete(true)
+	if b.store != nil {
+		b.store.Delete(true)
+	}
+	b.arena = nil
 	delete(batches.atomic, batchId)
 	// Reset so that another invocation doesn't double-account.
 	b.timer = nil
@@ -117,7 +180,10 @@ func (b *atomicBatch) stopLocked() {
 	}
 	globalInflightAtomicBatches.Add(-1)
 	b.timer.Stop()
-	b.store.Stop()
+	if b.store != nil {
+		b.store.Stop()
+	}
+	b.arena = nil
 	// Reset so that another invocation doesn't double-account.
 	b.timer = nil
 }
@@ -158,7 +224,7 @@ func (b *atomicBatch) readyForCommit() *BatchAbandonReason {
 	if !b.timer.Stop() {
 		return &BatchTimeout
 	}
-	if b.store.FlushAllPending() != nil {
+	if b.store != nil && b.store.FlushAllPending() != nil {
 		return &BatchIncomplete
 	}
 	return nil

@@ -44,6 +44,9 @@ var (
 	// benchHdrIndex parses a message's header block once on the ingest and
 	// apply paths instead of scanning it once per header lookup.
 	benchHdrIndex = benchFlag("NATS_BENCH_HDR_INDEX")
+	// benchStageArena stages in-memory atomic batches in a slice instead of
+	// a private memory store.
+	benchStageArena = benchFlag("NATS_BENCH_STAGE_ARENA")
 )
 
 func benchFlag(key string) bool {

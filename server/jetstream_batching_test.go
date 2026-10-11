@@ -772,8 +772,7 @@ func TestJetStreamAtomicBatchPublishCleanup(t *testing.T) {
 		batches.mu.Unlock()
 		require_Len(t, groups, 1)
 		require_NotNil(t, b)
-		store := b.store
-		require_Equal(t, store.State().Msgs, 1)
+		require_Equal(t, b.stagedCount(), 1)
 
 		// Should fully clean up the in-progress batch.
 		switch mode {
@@ -808,7 +807,7 @@ func TestJetStreamAtomicBatchPublishCleanup(t *testing.T) {
 					return fmt.Errorf("expected 0 groups, got %d", groups)
 				}
 			}
-			if msgs := store.State().Msgs; msgs != 0 {
+			if msgs := b.stagedCount(); msgs != 0 {
 				return fmt.Errorf("expected 0 messages, got %d", msgs)
 			}
 			return nil

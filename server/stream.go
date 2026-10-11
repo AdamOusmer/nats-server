@@ -7869,8 +7869,8 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 
 	// Persist, but optimize if we're committing because we already know last.
 	// If the underlying store is file-based we need to persist everything to survive hard kills, because we're R1.
-	if !commit || b.store.Type() == FileStorage {
-		seq, _, err := b.store.StoreMsg(subject, hdr, msg, 0)
+	if !commit || b.storageType() == FileStorage {
+		seq, err := b.stageMsg(subject, hdr, msg)
 		if err != nil || seq != batchSeq {
 			b.cleanupLocked(batchId, batches)
 			batches.mu.Unlock()
@@ -7961,9 +7961,9 @@ func (mset *stream) processJetStreamAtomicBatchMsg(batchId, subject, reply strin
 
 	diff := &batchStagedDiff{}
 	for seq := uint64(1); seq <= batchSeq; seq++ {
-		if seq == batchSeq && !commitEob && b.store.Type() != FileStorage {
+		if seq == batchSeq && !commitEob && b.storageType() != FileStorage {
 			bsubj, bhdr, bmsg = subject, hdr, msg
-		} else if sm, err = b.store.LoadMsg(seq, &smv); sm != nil && err == nil {
+		} else if sm, err = b.loadStaged(seq, &smv); sm != nil && err == nil {
 			bsubj, bhdr, bmsg = sm.subj, sm.hdr, sm.msg
 		} else {
 			rollback()
