@@ -7095,6 +7095,32 @@ func (o *consumer) signalSubs() []string {
 	return subs
 }
 
+// processStreamSignalBatch is processStreamSignal for every sequence of a
+// stored batch that matched this consumer: one lock, the pending count
+// advanced for each, and one wake if any is at or past the cursor.
+func (o *consumer) processStreamSignalBatch(seqs []uint64) {
+	if !o.leader.Load() {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.mset == nil {
+		return
+	}
+	var newer bool
+	for _, seq := range seqs {
+		if seq > o.npf {
+			o.npc++
+		}
+		if seq >= o.sseq {
+			newer = true
+		}
+	}
+	if newer && (o.isPushMode() && o.active || o.isPullMode() && !o.waiting.isEmpty()) {
+		o.signalNewMessages()
+	}
+}
+
 // This is what will be called when our parent stream wants to kick us regarding a new message.
 // We know that this subject matches us by how the parent handles registering us with the signaling sublist,
 // but we must check if we are leader.

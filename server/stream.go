@@ -8434,14 +8434,45 @@ func (mset *stream) signalConsumersLoop() {
 			return
 		case <-sch:
 			cms := msgs.pop()
-			for _, m := range cms {
-				seq, subj := m.seq, m.subj
-				m.returnToPool()
-				// Signal all appropriate consumers.
-				mset.signalConsumers(subj, seq)
+			if benchSignalCoalesce && len(cms) > 1 {
+				mset.signalConsumersBatch(cms)
+			} else {
+				for _, m := range cms {
+					seq, subj := m.seq, m.subj
+					m.returnToPool()
+					// Signal all appropriate consumers.
+					mset.signalConsumers(subj, seq)
+				}
 			}
 			msgs.recycle(&cms)
 		}
+	}
+}
+
+// signalConsumersBatch matches every message of a batch against the consumer
+// sublist, then signals each consumer once with the sequences that reached it,
+// so the consumer lock is taken once per batch rather than once per message.
+func (mset *stream) signalConsumersBatch(cms []*cMsg) {
+	mset.clsMu.RLock()
+	csl := mset.csl
+	if csl == nil {
+		mset.clsMu.RUnlock()
+		for _, m := range cms {
+			m.returnToPool()
+		}
+		return
+	}
+	sigs := make(map[*consumer][]uint64, 4)
+	for _, m := range cms {
+		seq, subj := m.seq, m.subj
+		m.returnToPool()
+		csl.Match(subj, func(o *consumer) {
+			sigs[o] = append(sigs[o], seq)
+		})
+	}
+	mset.clsMu.RUnlock()
+	for o, seqs := range sigs {
+		o.processStreamSignalBatch(seqs)
 	}
 }
 

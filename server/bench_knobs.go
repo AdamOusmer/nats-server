@@ -38,6 +38,9 @@ var (
 	// benchDeliverBatch keeps the consumer lock across up to n consecutive
 	// deliveries instead of releasing it after each one.
 	benchDeliverBatch = int(benchUint("NATS_BENCH_DELIVER_BATCH"))
+	// benchSignalCoalesce signals each consumer once per batch of stored
+	// messages instead of once per message.
+	benchSignalCoalesce = benchFlag("NATS_BENCH_SIGNAL_COALESCE")
 )
 
 func benchFlag(key string) bool {
