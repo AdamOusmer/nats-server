@@ -47,6 +47,9 @@ var (
 	// benchStageArena stages in-memory atomic batches in a slice instead of
 	// a private memory store.
 	benchStageArena = benchFlag("NATS_BENCH_STAGE_ARENA")
+	// benchRingIndex indexes memory store messages in a ring by sequence
+	// instead of a map.
+	benchRingIndex = benchFlag("NATS_BENCH_RING_INDEX")
 )
 
 func benchFlag(key string) bool {

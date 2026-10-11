@@ -36,7 +36,7 @@ type memStore struct {
 	mu          sync.RWMutex
 	cfg         StreamConfig
 	state       StreamState
-	msgs        map[uint64]*StoreMsg
+	msgs        msgIndex
 	fss         *stree.SubjectTree[SimpleState]
 	dmap        avl.SequenceSet
 	maxp        int64
@@ -67,7 +67,7 @@ func newMemStoreWithMode(cfg *StreamConfig, recovering bool) (*memStore, error) 
 		return nil, fmt.Errorf("memStore requires memory storage type in config")
 	}
 	ms := &memStore{
-		msgs:       make(map[uint64]*StoreMsg),
+		msgs:       newMsgIndex(),
 		fss:        stree.NewSubjectTree[SimpleState](),
 		maxp:       cfg.MaxMsgsPer,
 		cfg:        *cfg,
@@ -284,7 +284,7 @@ func (ms *memStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, tt
 			if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 				ms.recalculateForSubj(subj, ss)
 			}
-			sm, ok := ms.msgs[ss.First]
+			sm, ok := ms.idxget(ss.First)
 			if !ok || memStoreMsgSize(sm.subj, sm.hdr, sm.msg) < memStoreMsgSize(subj, hdr, msg) {
 				return ErrMaxBytes
 			}
@@ -313,7 +313,7 @@ func (ms *memStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, tt
 		sm.hdr = sm.buf[:len(hdr)]
 	}
 	sm.msg = sm.buf[len(hdr):]
-	ms.msgs[seq] = sm
+	ms.idxset(seq, sm)
 	ms.state.Msgs++
 	ms.state.Bytes += memStoreMsgSize(subj, hdr, msg)
 	ms.state.LastSeq = seq
@@ -523,16 +523,16 @@ func (ms *memStore) GetSeqFromTime(t time.Time) uint64 {
 	ts := t.UnixNano()
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
-	if len(ms.msgs) == 0 {
+	if ms.idxlen() == 0 {
 		return ms.state.LastSeq + 1
 	}
-	if ts <= ms.msgs[ms.state.FirstSeq].ts {
+	if ts <= ms.idxget1(ms.state.FirstSeq).ts {
 		return ms.state.FirstSeq
 	}
 	// LastSeq is not guaranteed to be present since last does not go backwards.
 	var lmsg *StoreMsg
 	for lseq := ms.state.LastSeq; lseq > ms.state.FirstSeq; lseq-- {
-		if lmsg = ms.msgs[lseq]; lmsg != nil {
+		if lmsg = ms.idxget1(lseq); lmsg != nil {
 			break
 		}
 	}
@@ -565,7 +565,7 @@ loop:
 		// Potentially skip over gaps. We keep the original middle but keep track of a
 		// potential delete range with an offset.
 		for {
-			msg := ms.msgs[mid+off]
+			msg := ms.idxget1(mid + off)
 			if msg == nil {
 				off++
 				if mid+off <= lseq {
@@ -726,15 +726,15 @@ func (ms *memStore) filteredStateLocked(sseq uint64, filter string, lastPerSubje
 		}
 		// Check if easier to just scan msgs vs the sequence range.
 		// This can happen with lots of interior deletes.
-		if last-first > uint64(len(ms.msgs)) {
-			for _, sm := range ms.msgs {
+		if last-first > uint64(ms.idxlen()) {
+			for sm := range ms.idxall() {
 				if sm.seq >= first && sm.seq <= last && !seen[sm.subj] && isMatch(sm.subj) {
 					update(sm)
 				}
 			}
 		} else {
 			for seq := first; seq <= last; seq++ {
-				if sm, ok := ms.msgs[seq]; ok && !seen[sm.subj] && isMatch(sm.subj) {
+				if sm, ok := ms.idxget(seq); ok && !seen[sm.subj] && isMatch(sm.subj) {
 					update(sm)
 				}
 			}
@@ -761,22 +761,22 @@ func (ms *memStore) filteredStateLocked(sseq uint64, filter string, lastPerSubje
 			}
 		}
 		// Check if easier to just scan msgs vs the sequence range.
-		if first-ms.state.FirstSeq > uint64(len(ms.msgs)) {
-			for _, sm := range ms.msgs {
+		if first-ms.state.FirstSeq > uint64(ms.idxlen()) {
+			for sm := range ms.idxall() {
 				if sm.seq < first && !seen[sm.subj] && isMatch(sm.subj) {
 					update(sm)
 				}
 			}
 		} else {
 			for seq := ms.state.FirstSeq; seq < first; seq++ {
-				if sm, ok := ms.msgs[seq]; ok && !seen[sm.subj] && isMatch(sm.subj) {
+				if sm, ok := ms.idxget(seq); ok && !seen[sm.subj] && isMatch(sm.subj) {
 					update(sm)
 				}
 			}
 		}
 		// Now do range at end.
 		for seq := last + 1; seq < ms.state.LastSeq; seq++ {
-			if sm, ok := ms.msgs[seq]; ok && !seen[sm.subj] && isMatch(sm.subj) {
+			if sm, ok := ms.idxget(seq); ok && !seen[sm.subj] && isMatch(sm.subj) {
 				adjust++
 				if seen != nil {
 					seen[sm.subj] = true
@@ -788,9 +788,9 @@ func (ms *memStore) filteredStateLocked(sseq uint64, filter string, lastPerSubje
 			// Check if easier to just scan msgs vs the sequence range.
 			// Since we will need to scan all of the msgs vs below where we break on the first match,
 			// we will only do so if a few orders of magnitude lower.
-			if last-first > 100*uint64(len(ms.msgs)) {
+			if last-first > 100*uint64(ms.idxlen()) {
 				low := ms.state.LastSeq
-				for _, sm := range ms.msgs {
+				for sm := range ms.idxall() {
 					if sm.seq >= first && sm.seq < last && isMatch(sm.subj) {
 						if sm.seq < low {
 							low = sm.seq
@@ -802,7 +802,7 @@ func (ms *memStore) filteredStateLocked(sseq uint64, filter string, lastPerSubje
 				}
 			} else {
 				for seq := first; seq < last; seq++ {
-					if sm, ok := ms.msgs[seq]; ok && isMatch(sm.subj) {
+					if sm, ok := ms.idxget(seq); ok && isMatch(sm.subj) {
 						ss.First = seq
 						break
 					}
@@ -857,7 +857,7 @@ func (ms *memStore) AllLastSeqs() ([]uint64, error) {
 // subjects, but won't take the lock to do it, to avoid the issue of compounding
 // read locks causing a deadlock with a write lock.
 func (ms *memStore) allLastSeqsLocked() ([]uint64, error) {
-	if len(ms.msgs) == 0 {
+	if ms.idxlen() == 0 {
 		return nil, nil
 	}
 
@@ -907,7 +907,7 @@ func (ms *memStore) MultiLastSeqs(filters []string, maxSeq uint64, maxAllowed in
 
 // Write lock should be held, for recalculateForSubj.
 func (ms *memStore) multiLastSeqsLocked(filters []string, maxSeq uint64, maxAllowed int) ([]uint64, error) {
-	if len(ms.msgs) == 0 {
+	if ms.idxlen() == 0 {
 		return nil, nil
 	}
 
@@ -942,7 +942,7 @@ func (ms *memStore) multiLastSeqsLocked(filters []string, maxSeq uint64, maxAllo
 				// The last is greater than maxSeq.
 				s := bytesToString(subj)
 				for seq := maxSeq; seq > 0; seq-- {
-					if sm, ok := ms.msgs[seq]; ok && sm.subj == s {
+					if sm, ok := ms.idxget(seq); ok && sm.subj == s {
 						addIfNotDupe(seq)
 						break
 					}
@@ -1156,15 +1156,15 @@ func (ms *memStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPerS
 		}
 		// Check if easier to just scan msgs vs the sequence range.
 		// This can happen with lots of interior deletes.
-		if last-first > uint64(len(ms.msgs)) {
-			for _, sm := range ms.msgs {
+		if last-first > uint64(ms.idxlen()) {
+			for sm := range ms.idxall() {
 				if sm.seq >= first && sm.seq <= last && !seen[sm.subj] && sl.HasInterest(sm.subj) {
 					update(sm)
 				}
 			}
 		} else {
 			for seq := first; seq <= last; seq++ {
-				if sm, ok := ms.msgs[seq]; ok && !seen[sm.subj] && sl.HasInterest(sm.subj) {
+				if sm, ok := ms.idxget(seq); ok && !seen[sm.subj] && sl.HasInterest(sm.subj) {
 					update(sm)
 				}
 			}
@@ -1191,22 +1191,22 @@ func (ms *memStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPerS
 			}
 		}
 		// Check if easier to just scan msgs vs the sequence range.
-		if first-ms.state.FirstSeq > uint64(len(ms.msgs)) {
-			for _, sm := range ms.msgs {
+		if first-ms.state.FirstSeq > uint64(ms.idxlen()) {
+			for sm := range ms.idxall() {
 				if sm.seq < first && !seen[sm.subj] && sl.HasInterest(sm.subj) {
 					update(sm)
 				}
 			}
 		} else {
 			for seq := ms.state.FirstSeq; seq < first; seq++ {
-				if sm, ok := ms.msgs[seq]; ok && !seen[sm.subj] && sl.HasInterest(sm.subj) {
+				if sm, ok := ms.idxget(seq); ok && !seen[sm.subj] && sl.HasInterest(sm.subj) {
 					update(sm)
 				}
 			}
 		}
 		// Now do range at end.
 		for seq := last + 1; seq < ms.state.LastSeq; seq++ {
-			if sm, ok := ms.msgs[seq]; ok && !seen[sm.subj] && sl.HasInterest(sm.subj) {
+			if sm, ok := ms.idxget(seq); ok && !seen[sm.subj] && sl.HasInterest(sm.subj) {
 				adjust++
 				if seen != nil {
 					seen[sm.subj] = true
@@ -1627,7 +1627,7 @@ func (ms *memStore) PurgeEx(subject string, sequence, keep uint64) (purged uint6
 	var lowSubj string
 	ms.mu.Lock()
 	for seq := ss.First; seq <= last; seq++ {
-		if sm, ok := ms.msgs[seq]; ok && eq(sm.subj, subject) {
+		if sm, ok := ms.idxget(seq); ok && eq(sm.subj, subject) {
 			if subj, sz, ok := ms.removeMsgNoCB(sm.seq, false); ok {
 				purged++
 				bytes += sz
@@ -1661,7 +1661,7 @@ func (ms *memStore) Purge() (uint64, error) {
 
 func (ms *memStore) purge(fseq uint64) (uint64, error) {
 	ms.mu.Lock()
-	purged := uint64(len(ms.msgs))
+	purged := uint64(ms.idxlen())
 	cb := ms.scb
 	bytes := int64(ms.state.Bytes)
 	if fseq == 0 {
@@ -1676,7 +1676,7 @@ func (ms *memStore) purge(fseq uint64) (uint64, error) {
 	ms.state.Bytes = 0
 	ms.state.Msgs = 0
 	if ms.msgs != nil {
-		ms.msgs = make(map[uint64]*StoreMsg)
+		ms.msgs = newMsgIndex()
 	}
 	ms.fss = stree.NewSubjectTree[SimpleState]()
 	ms.dmap.Empty()
@@ -1716,19 +1716,19 @@ func (ms *memStore) compact(seq uint64) (uint64, error) {
 		fseq := ms.state.FirstSeq
 		// Determine new first sequence.
 		for ; seq <= ms.state.LastSeq; seq++ {
-			if sm, ok := ms.msgs[seq]; ok {
+			if sm, ok := ms.idxget(seq); ok {
 				ms.state.FirstSeq = seq
 				ms.state.FirstTime = time.Unix(0, sm.ts).UTC()
 				break
 			}
 		}
 		for seq := seq - 1; seq >= fseq; seq-- {
-			if sm := ms.msgs[seq]; sm != nil {
+			if sm := ms.idxget1(seq); sm != nil {
 				bytes += memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
 				purged++
 				ms.removeSeqPerSubject(sm.subj, seq)
 				// Must delete message after updating per-subject info, to be consistent with file store.
-				delete(ms.msgs, seq)
+				ms.idxdel(seq)
 			} else if !ms.dmap.IsEmpty() {
 				ms.dmap.Delete(seq)
 			}
@@ -1748,7 +1748,7 @@ func (ms *memStore) compact(seq uint64) (uint64, error) {
 	} else {
 		// We are compacting past the end of our range. Do purge and set sequences correctly
 		// such that the next message placed will have seq.
-		purged = uint64(len(ms.msgs))
+		purged = uint64(ms.idxlen())
 		bytes = ms.state.Bytes
 		ms.state.Bytes = 0
 		ms.state.Msgs = 0
@@ -1756,7 +1756,7 @@ func (ms *memStore) compact(seq uint64) (uint64, error) {
 		ms.state.FirstTime = time.Time{}
 		ms.state.LastSeq = seq - 1
 		// Reset msgs, fss and dmap.
-		ms.msgs = make(map[uint64]*StoreMsg)
+		ms.msgs = newMsgIndex()
 		ms.fss = stree.NewSubjectTree[SimpleState]()
 		ms.dmap.Empty()
 		ms.sdm.empty()
@@ -1776,7 +1776,7 @@ func (ms *memStore) reset() error {
 	var purged, bytes uint64
 	cb := ms.scb
 	if cb != nil {
-		for _, sm := range ms.msgs {
+		for sm := range ms.idxall() {
 			purged++
 			bytes += memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
 		}
@@ -1791,7 +1791,7 @@ func (ms *memStore) reset() error {
 	ms.state.Msgs = 0
 	ms.state.Bytes = 0
 	// Reset msgs, fss and dmap.
-	ms.msgs = make(map[uint64]*StoreMsg)
+	ms.msgs = newMsgIndex()
 	ms.fss = stree.NewSubjectTree[SimpleState]()
 	ms.dmap.Empty()
 	ms.sdm.empty()
@@ -1815,19 +1815,19 @@ func (ms *memStore) Truncate(seq uint64) error {
 	var purged, bytes uint64
 
 	ms.mu.Lock()
-	lsm, ok := ms.msgs[seq]
+	lsm, ok := ms.idxget(seq)
 	lastTime := ms.state.LastTime
 	if ok && lsm != nil {
 		lastTime = time.Unix(0, lsm.ts).UTC()
 	}
 
 	for i := ms.state.LastSeq; i > seq; i-- {
-		if sm := ms.msgs[i]; sm != nil {
+		if sm := ms.idxget1(i); sm != nil {
 			purged++
 			bytes += memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
 			ms.removeSeqPerSubject(sm.subj, i)
 			// Must delete message after updating per-subject info, to be consistent with file store.
-			delete(ms.msgs, i)
+			ms.idxdel(i)
 		} else if !ms.dmap.IsEmpty() {
 			ms.dmap.Delete(i)
 		}
@@ -1872,7 +1872,7 @@ func (ms *memStore) SubjectForSeq(seq uint64) (string, error) {
 	if seq < ms.state.FirstSeq {
 		return _EMPTY_, ErrStoreMsgNotFound
 	}
-	if sm, ok := ms.msgs[seq]; ok {
+	if sm, ok := ms.idxget(seq); ok {
 		// Copy the subject, as it's used elsewhere, and we've released the lock in the meantime.
 		return copyString(sm.subj), nil
 	}
@@ -1889,7 +1889,7 @@ func (ms *memStore) loadMsgLocked(seq uint64, smp *StoreMsg, needMSLock bool) (*
 	if needMSLock {
 		ms.mu.RLock()
 	}
-	sm, ok := ms.msgs[seq]
+	sm, ok := ms.idxget(seq)
 	last := ms.state.LastSeq
 	if needMSLock {
 		ms.mu.RUnlock()
@@ -1926,7 +1926,7 @@ func (ms *memStore) loadLastLocked(subject string, smp *StoreMsg) (*StoreMsg, er
 	var ok bool
 
 	if subject == _EMPTY_ || subject == fwcs {
-		sm, ok = ms.msgs[ms.state.LastSeq]
+		sm, ok = ms.idxget(ms.state.LastSeq)
 	} else if subjectIsLiteral(subject) {
 		var ss *SimpleState
 		if ss, ok = ms.fss.Find(stringToBytes(subject)); ok && ss.Msgs > 0 {
@@ -1934,10 +1934,10 @@ func (ms *memStore) loadLastLocked(subject string, smp *StoreMsg) (*StoreMsg, er
 			if ss.lastNeedsUpdate {
 				ms.recalculateForSubj(subject, ss)
 			}
-			sm, ok = ms.msgs[ss.Last]
+			sm, ok = ms.idxget(ss.Last)
 		}
 	} else if ss := ms.filteredStateLocked(1, subject, true); ss.Msgs > 0 {
-		sm, ok = ms.msgs[ss.Last]
+		sm, ok = ms.idxget(ss.Last)
 	}
 	if !ok || sm == nil {
 		return nil, ErrStoreMsgNotFound
@@ -1969,7 +1969,7 @@ func (ms *memStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *S
 	fseq, lseq := start, ms.state.LastSeq
 
 	for nseq := fseq; nseq <= lseq; nseq++ {
-		sm, ok := ms.msgs[nseq]
+		sm, ok := ms.idxget(nseq)
 		if !ok {
 			continue
 		}
@@ -2101,7 +2101,7 @@ func (ms *memStore) loadNextMsgLocked(filter string, wc bool, start uint64, smp 
 	}
 
 	for nseq := fseq; nseq <= lseq; nseq++ {
-		if sm, ok := ms.msgs[nseq]; ok && (isAll || eq(sm.subj, filter)) {
+		if sm, ok := ms.idxget(nseq); ok && (isAll || eq(sm.subj, filter)) {
 			if smp == nil {
 				smp = new(StoreMsg)
 			}
@@ -2138,7 +2138,7 @@ func (ms *memStore) LoadPrevMsg(filter string, wc bool, start uint64, smp *Store
 	}
 
 	for seq := start; seq >= ms.state.FirstSeq; seq-- {
-		if sm, ok := ms.msgs[seq]; ok && (isAll || eq(sm.subj, filter)) {
+		if sm, ok := ms.idxget(seq); ok && (isAll || eq(sm.subj, filter)) {
 			if smp == nil {
 				smp = new(StoreMsg)
 			}
@@ -2239,7 +2239,7 @@ func (ms *memStore) loadPrevMsgMultiLocked(sl *gsl.SimpleSublist, start uint64, 
 	fseq, lseq := start, ms.state.FirstSeq
 
 	for nseq := fseq; nseq >= lseq; nseq-- {
-		sm, ok := ms.msgs[nseq]
+		sm, ok := ms.idxget(nseq)
 		if !ok {
 			continue
 		}
@@ -2281,7 +2281,7 @@ func (ms *memStore) updateFirstSeq(seq uint64) {
 	var nsm *StoreMsg
 	var ok bool
 	for nseq := ms.state.FirstSeq + 1; nseq <= ms.state.LastSeq; nseq++ {
-		if nsm, ok = ms.msgs[nseq]; ok {
+		if nsm, ok = ms.idxget(nseq); ok {
 			break
 		}
 	}
@@ -2346,7 +2346,7 @@ func (ms *memStore) recalculateForSubj(subj string, ss *SimpleState) {
 			tseq = ms.state.FirstSeq
 		}
 		for ; tseq <= ss.Last; tseq++ {
-			if sm := ms.msgs[tseq]; sm != nil && sm.subj == subj {
+			if sm := ms.idxget1(tseq); sm != nil && sm.subj == subj {
 				ss.First = tseq
 				ss.firstNeedsUpdate = false
 				if ss.Msgs == 1 {
@@ -2364,7 +2364,7 @@ func (ms *memStore) recalculateForSubj(subj string, ss *SimpleState) {
 			tseq = ms.state.LastSeq
 		}
 		for ; tseq >= ss.First; tseq-- {
-			if sm := ms.msgs[tseq]; sm != nil && sm.subj == subj {
+			if sm := ms.idxget1(tseq); sm != nil && sm.subj == subj {
 				ss.Last = tseq
 				ss.lastNeedsUpdate = false
 				if ss.Msgs == 1 {
@@ -2399,7 +2399,7 @@ func (ms *memStore) removeMsg(seq uint64, secure bool) bool {
 // Returns the removed message's subject and size.
 // Lock should be held.
 func (ms *memStore) removeMsgNoCB(seq uint64, secure bool) (subj string, size uint64, ok bool) {
-	sm, ok := ms.msgs[seq]
+	sm, ok := ms.idxget(seq)
 	if !ok {
 		return _EMPTY_, 0, false
 	}
@@ -2438,7 +2438,7 @@ func (ms *memStore) removeMsgNoCB(seq uint64, secure bool) (subj string, size ui
 	}
 
 	// Must delete message after updating per-subject info, to be consistent with file store.
-	delete(ms.msgs, seq)
+	ms.idxdel(seq)
 
 	return sm.subj, size, true
 }
