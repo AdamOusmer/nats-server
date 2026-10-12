@@ -1,0 +1,39 @@
+name: Bench knobs
+
+on:
+  push:
+    branches: ['bagel/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        knobs: ['off', production]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Set production knobs
+        if: matrix.knobs == 'production'
+        run: |
+          cat >> "$GITHUB_ENV" <<'EOF'
+          NATS_BENCH_TLS_COLLAPSE=1
+          NATS_BENCH_PROPOSE_COALESCE=200us
+          NATS_BENCH_ACKNONE_PROPOSE_EVERY=64
+          NATS_BENCH_DELIVER_BATCH=32
+          NATS_BENCH_SIGNAL_COALESCE=1
+          NATS_BENCH_HDR_INDEX=1
+          NATS_BENCH_STAGE_ARENA=1
+          NATS_BENCH_RING_INDEX=1
+          NATS_BENCH_STORE_SLAB=1
+          NATS_BENCH_INTERN=1
+          EOF
+      - name: Test
+        run: go test ./server -run 'Schedul|MemStore|JetStreamBatch|JetStreamAtomicBatch|Stream.*Limit|Consumer.*Pending|LimitEviction|HdrIndex|MsgIndex|Slab|TLS' -count=1 -timeout 30m

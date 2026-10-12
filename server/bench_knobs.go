@@ -51,7 +51,8 @@ var (
 	// instead of a map.
 	benchRingIndex = benchFlag("NATS_BENCH_RING_INDEX")
 	// benchEvictBatch evicts for a memory store's byte limit as one run from
-	// the head, n messages past the limit, reported in one callback.
+	// the head, intentionally trimming up to n extra messages below MaxBytes,
+	// reported in one callback.
 	benchEvictBatch = int(benchUint("NATS_BENCH_EVICT_BATCH"))
 	// benchStoreSlab allocates memory store messages from shared slabs.
 	benchStoreSlab = benchFlag("NATS_BENCH_STORE_SLAB")
