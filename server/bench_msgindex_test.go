@@ -128,3 +128,32 @@ func TestMsgIndexRingTruncateAndCompact(t *testing.T) {
 		})
 	}
 }
+
+func TestMsgIndexRingShrinksOnEviction(t *testing.T) {
+	defer func(ring bool, batch int) { benchRingIndex, benchEvictBatch = ring, batch }(benchRingIndex, benchEvictBatch)
+	benchRingIndex = true
+	for _, batch := range []int{0, 64} {
+		t.Run(fmt.Sprintf("batch=%d", batch), func(t *testing.T) {
+			benchEvictBatch = batch
+			ms, err := newMemStore(&StreamConfig{Storage: MemoryStorage})
+			require_NoError(t, err)
+			defer ms.Stop()
+			for range 8 * ringMinSize {
+				_, _, err := ms.StoreMsg("a", nil, nil, 0)
+				require_NoError(t, err)
+			}
+			r := ms.msgs.(*ringMsgIndex)
+			require_Equal(t, len(r.buf), 8*ringMinSize)
+			cfg := ms.cfg
+			cfg.MaxBytes = int64(100 * memStoreMsgSize("a", nil, nil))
+			require_NoError(t, ms.UpdateConfig(&cfg))
+			require_Equal(t, len(r.buf), ringMinSize)
+			state := ms.State()
+			require_Equal(t, uint64(r.n), state.Msgs)
+			for seq := state.FirstSeq; seq <= state.LastSeq; seq++ {
+				_, err := ms.LoadMsg(seq, nil)
+				require_NoError(t, err)
+			}
+		})
+	}
+}

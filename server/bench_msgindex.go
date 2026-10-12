@@ -228,3 +228,10 @@ func (ms *memStore) idxall() iter.Seq[*StoreMsg] {
 	}
 	return ms.msgs.all()
 }
+
+// Lock should be held.
+func (ms *memStore) shrinkIndexLocked() {
+	if r, ok := ms.msgs.(*ringMsgIndex); ok && r.n > 0 && len(r.buf) > ringMinSize && r.hi-r.base+1 < uint64(len(r.buf)/4) {
+		r.shrink()
+	}
+}
