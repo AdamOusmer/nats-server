@@ -7194,10 +7194,13 @@ func (o *consumer) terminateStreamPendingLocked(seq uint64, p *Pending, dc uint6
 	o.rmTerm[seq] = p
 	dseq := p.Sequence
 	go func() {
-		o.mu.Lock()
-		if !o.closed {
-			o.processTermLocked(seq, dseq, dc, ackTermUnackedLimitsReason, _EMPTY_, false)
+		o.mu.RLock()
+		closed := o.closed
+		o.mu.RUnlock()
+		if !closed {
+			o.processTerm(seq, dseq, dc, ackTermUnackedLimitsReason, _EMPTY_)
 		}
+		o.mu.Lock()
 		if o.rmTerm[seq] == p {
 			delete(o.rmTerm, seq)
 		}

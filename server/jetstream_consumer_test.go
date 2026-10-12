@@ -14025,6 +14025,76 @@ func testJetStreamConsumerLimitEvictionDoesNotWaitForLock(t *testing.T, policy n
 	require_Error(t, err, nats.ErrTimeout)
 }
 
+func TestJetStreamConsumerLimitRemovalTermAcksInPlace(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		retention nats.RetentionPolicy
+	}{
+		{"interest-ackall", nats.InterestPolicy},
+		{"workqueue-ackall", nats.WorkQueuePolicy},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := RunBasicJetStreamServer(t)
+			defer s.Shutdown()
+
+			nc, js := jsClientConnect(t, s)
+			defer nc.Close()
+
+			_, err := js.AddStream(&nats.StreamConfig{
+				Name:              "TEST",
+				Subjects:          []string{"a", "b"},
+				Storage:           nats.MemoryStorage,
+				Replicas:          1,
+				Retention:         test.retention,
+				MaxMsgsPerSubject: 1,
+			})
+			require_NoError(t, err)
+			ackPolicy := nats.AckAllPolicy
+			if test.retention == nats.WorkQueuePolicy {
+				ackPolicy = nats.AckExplicitPolicy
+			}
+			_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+				Durable:   "C",
+				AckPolicy: ackPolicy,
+				AckWait:   time.Hour,
+			})
+			require_NoError(t, err)
+			sub, err := js.PullSubscribe(_EMPTY_, "C", nats.Bind("TEST", "C"))
+			require_NoError(t, err)
+			if test.retention == nats.WorkQueuePolicy {
+				// The API requires explicit acks, so set AckAll to exercise this termination path.
+				mset, err := s.globalAccount().lookupStream("TEST")
+				require_NoError(t, err)
+				o := mset.lookupConsumer("C")
+				require_NotNil(t, o)
+				o.mu.Lock()
+				o.cfg.AckPolicy = AckAll
+				o.mu.Unlock()
+			}
+
+			_, err = js.Publish("b", nil)
+			require_NoError(t, err)
+			_, err = js.Publish("a", nil)
+			require_NoError(t, err)
+			require_Len(t, len(fetchMsgs(t, sub, 2, time.Second)), 2)
+			_, err = js.Publish("a", nil)
+			require_NoError(t, err)
+
+			// Terminating sequence 2 also acknowledges the earlier pending sequence 1.
+			checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+				si, err := js.StreamInfo("TEST")
+				if err != nil {
+					return err
+				}
+				if si.State.Msgs != 1 || si.State.FirstSeq != 3 {
+					return fmt.Errorf("expected msgs=1 first_seq=3, got msgs=%d first_seq=%d", si.State.Msgs, si.State.FirstSeq)
+				}
+				return nil
+			})
+		})
+	}
+}
+
 func TestJetStreamConsumerPendingRemovalQueue(t *testing.T) {
 	defer func(old int) { benchEvictBatch = old }(benchEvictBatch)
 	for _, policy := range []AckPolicy{AckNone, AckExplicit, AckAll} {
