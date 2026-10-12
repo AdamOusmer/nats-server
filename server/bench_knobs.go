@@ -32,8 +32,7 @@ var (
 	// duration after a kick, so one append entry carries more updates.
 	benchProposeCoalesce = benchDuration("NATS_BENCH_PROPOSE_COALESCE")
 	// benchAckNoneEvery replicates an AckNone consumer's delivered cursor
-	// every n deliveries instead of every delivery. A new consumer leader
-	// can resend up to n-1 messages the old one already delivered.
+	// every n deliveries on limits streams, and flushes on idle or leadership change.
 	benchAckNoneEvery = benchUint("NATS_BENCH_ACKNONE_PROPOSE_EVERY")
 	// benchDeliverBatch keeps the consumer lock across up to n consecutive
 	// deliveries instead of releasing it after each one.

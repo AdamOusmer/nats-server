@@ -14,14 +14,20 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        knobs: ['off', production]
+        include:
+          - knobs: 'off'
+            race: ''
+          - knobs: production
+            race: '-race'
+          - knobs: eviction
+            race: '-race'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Set production knobs
-        if: matrix.knobs == 'production'
+        if: matrix.knobs != 'off'
         run: |
           cat >> "$GITHUB_ENV" <<'EOF'
           NATS_BENCH_TLS_COLLAPSE=1
@@ -35,5 +41,8 @@ jobs:
           NATS_BENCH_STORE_SLAB=1
           NATS_BENCH_INTERN=1
           EOF
+      - name: Set eviction knob
+        if: matrix.knobs == 'eviction'
+        run: echo 'NATS_BENCH_EVICT_BATCH=64' >> "$GITHUB_ENV"
       - name: Test
-        run: go test ./server -run 'Schedul|MemStore|JetStreamBatch|JetStreamAtomicBatch|Stream.*Limit|Consumer.*Pending|LimitEviction|HdrIndex|MsgIndex|Slab|TLS' -count=1 -timeout 30m
+        run: go test ./server -run 'Schedul|MemStore|JetStreamBatch|JetStreamAtomicBatch|Stream.*Limit|Consumer.*Pending|LimitEviction|HdrIndex|MsgIndex|Slab|TLS|JetStreamConsumer|JetStreamCluster.*(Consumer|Ack|Pending|Leafnode)' ${{ matrix.race }} -count=1 -timeout 60m
