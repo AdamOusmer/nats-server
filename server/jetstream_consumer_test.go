@@ -14277,13 +14277,18 @@ func TestJetStreamConsumerPendingRemovalTerminationOnce(t *testing.T) {
 	}
 }
 
-func waitForConsumerDeliveryIdle(t *testing.T) {
+func waitForConsumerDeliveryIdle(t *testing.T, o *consumer) {
 	t.Helper()
+	receiver := []byte(fmt.Sprintf("(*consumer).loopAndGatherMsgs(%p,", o))
 	checkFor(t, time.Second, time.Millisecond, func() error {
 		buf := make([]byte, 64*1024)
 		n := runtime.Stack(buf, true)
+		for n == len(buf) {
+			buf = make([]byte, 2*len(buf))
+			n = runtime.Stack(buf, true)
+		}
 		for _, stack := range bytes.Split(buf[:n], []byte("\n\n")) {
-			if bytes.Contains(stack, []byte("[select]")) && bytes.Contains(stack, []byte("(*consumer).loopAndGatherMsgs(")) {
+			if bytes.Contains(stack, []byte("[select]")) && bytes.Contains(stack, receiver) {
 				return nil
 			}
 		}
@@ -14299,7 +14304,7 @@ func TestJetStreamConsumerPendingRemovalDeliveryIdle(t *testing.T) {
 		close(done)
 	}()
 	defer func() { close(qch); <-done }()
-	waitForConsumerDeliveryIdle(t)
+	waitForConsumerDeliveryIdle(t, o)
 	o.mu.Lock()
 	_, err := store.RemoveMsg(5)
 	queued := o.rmQueued.Load()
@@ -14317,6 +14322,63 @@ func TestJetStreamConsumerPendingRemovalDeliveryIdle(t *testing.T) {
 	require_Equal(t, q.len(), 1)
 }
 
+func TestJetStreamConsumerPendingRemovalDeliveryIdleReceiver(t *testing.T) {
+	other, _, _ := newConsumerPendingRemovalTest(t, MemoryStorage)
+	otherQuit, otherDone := make(chan struct{}), make(chan struct{})
+	go func() {
+		other.loopAndGatherMsgs(otherQuit)
+		close(otherDone)
+	}()
+	defer func() { close(otherQuit); <-otherDone }()
+	waitForConsumerDeliveryIdle(t, other)
+
+	o, _, _ := newConsumerPendingRemovalTest(t, MemoryStorage)
+	quit, done := make(chan struct{}), make(chan struct{})
+	o.mu.Lock()
+	go func() {
+		o.loopAndGatherMsgs(quit)
+		close(done)
+	}()
+	defer func() { close(quit); <-done }()
+	waiting, idle := make(chan struct{}), make(chan struct{})
+	go func() {
+		close(waiting)
+		waitForConsumerDeliveryIdle(t, o)
+		close(idle)
+	}()
+	<-waiting
+	select {
+	case <-idle:
+		o.mu.Unlock()
+		t.Fatal("another consumer's delivery loop satisfied the idle check")
+	case <-time.After(20 * time.Millisecond):
+	}
+	o.mu.Unlock()
+	select {
+	case <-idle:
+	case <-time.After(time.Second):
+		t.Fatal("consumer's delivery loop did not become idle")
+	}
+}
+
+func TestJetStreamConsumerTermAdvisoryClosed(t *testing.T) {
+	o, _, q := newConsumerPendingRemovalTest(t, MemoryStorage)
+	o.cfg.DeliverSubject = _EMPTY_
+	require_NoError(t, o.stopWithFlags(false, false, false, false))
+	require_True(t, o.isClosed())
+	require_False(t, o.processTerm(5, 5, 1, ackTermUnackedLimitsReason, _EMPTY_))
+	msgs := q.pop()
+	require_Len(t, len(msgs), 1)
+	defer msgs[0].returnToPool()
+	var e JSConsumerDeliveryTerminatedAdvisory
+	require_NoError(t, json.Unmarshal(msgs[0].msg, &e))
+	require_Equal(t, e.Type, JSConsumerDeliveryTerminatedAdvisoryType)
+	require_Equal(t, e.ConsumerSeq, 5)
+	require_Equal(t, e.StreamSeq, 5)
+	require_Equal(t, e.Deliveries, 1)
+	require_Equal(t, e.Reason, ackTermUnackedLimitsReason)
+}
+
 func TestJetStreamConsumerPendingRemovalClosed(t *testing.T) {
 	for _, path := range []string{"queued", "terminating", "closed"} {
 		t.Run(path, func(t *testing.T) {
@@ -14329,6 +14391,9 @@ func TestJetStreamConsumerPendingRemovalClosed(t *testing.T) {
 			o.closed = true
 			if path == "closed" {
 				o.terminateStreamPendingLocked(5, o.pending[5], 1)
+				// The lock keeps any newly started termination from clearing rmTerm.
+				require_Len(t, len(o.rmTerm), 0)
+				require_Equal(t, q.len(), 0)
 			}
 			o.releaseDeliveryLock()
 			require_NoError(t, err)
@@ -14562,6 +14627,83 @@ func TestJetStreamConsumerAckNoneCursorLeaderAndStop(t *testing.T) {
 			defer o.mu.Unlock()
 			require_Len(t, len(n.forwarded), 1)
 			require_True(t, o.phead == nil)
+		})
+	}
+}
+
+type ackNoneCursorTestStore struct {
+	ConsumerStore
+	dseq, sseq, dc uint64
+	ts             int64
+}
+
+func (s *ackNoneCursorTestStore) UpdateDelivered(dseq, sseq, dc uint64, ts int64) error {
+	s.dseq, s.sseq, s.dc, s.ts = dseq, sseq, dc, ts
+	return s.ConsumerStore.UpdateDelivered(dseq, sseq, dc, ts)
+}
+
+func TestJetStreamConsumerAckNoneCursorNodeCleared(t *testing.T) {
+	defer func(every uint64, delay time.Duration) {
+		benchAckNoneEvery, benchProposeCoalesce = every, delay
+	}(benchAckNoneEvery, benchProposeCoalesce)
+	benchAckNoneEvery, benchProposeCoalesce = 64, 0
+	for _, path := range []string{"leader", "stop", "timer"} {
+		t.Run(path, func(t *testing.T) {
+			benchProposeCoalesce = time.Hour
+			if path == "timer" {
+				benchProposeCoalesce = 0
+			}
+			ms, err := newMemStore(&StreamConfig{Name: "TEST", Storage: MemoryStorage})
+			require_NoError(t, err)
+			defer ms.Stop()
+			cfg := ConsumerConfig{AckPolicy: AckNone}
+			cs, err := ms.ConsumerStore("C", time.Now(), &cfg)
+			require_NoError(t, err)
+			store := &ackNoneCursorTestStore{ConsumerStore: cs}
+			s := &Server{opts: DefaultOptions(), gateway: &srvGateway{}}
+			o := &consumer{srv: s, node: &ackNoneCursorTestNode{}, store: store, retention: LimitsPolicy, cfg: cfg}
+			o.leader.Store(true)
+			o.mu.Lock()
+			o.updateDelivered(5, 105, 1, 123)
+			require_NotNil(t, o.ackNoneTimer)
+			o.node = nil
+			o.mu.Unlock()
+			defer func() {
+				o.mu.Lock()
+				stopAndClearTimer(&o.ackNoneTimer)
+				o.mu.Unlock()
+			}()
+			switch path {
+			case "leader":
+				require_NoError(t, o.setLeader(true, 0))
+			case "stop":
+				require_NoError(t, o.stopWithFlags(false, false, false, false))
+			case "timer":
+				checkFor(t, time.Second, time.Millisecond, func() error {
+					o.mu.Lock()
+					defer o.mu.Unlock()
+					if o.ackNoneTimer != nil {
+						return errors.New("cursor timer has not fired")
+					}
+					return nil
+				})
+			}
+			o.mu.Lock()
+			dseq, sseq, dc, ts := store.dseq, store.sseq, store.dc, store.ts
+			flushed := o.ackNoneTimer == nil && len(o.ackNoneCursor) == 0
+			o.mu.Unlock()
+			// The stop path closes the store, so inspect its state under its lock.
+			cms := cs.(*consumerMemStore)
+			cms.mu.Lock()
+			state := cms.state
+			cms.mu.Unlock()
+			require_Equal(t, state.Delivered.Consumer, 5)
+			require_Equal(t, state.Delivered.Stream, 105)
+			require_Equal(t, dseq, 5)
+			require_Equal(t, sseq, 105)
+			require_Equal(t, dc, 1)
+			require_Equal(t, ts, 123)
+			require_True(t, flushed)
 		})
 	}
 }
