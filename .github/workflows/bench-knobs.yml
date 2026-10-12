@@ -21,13 +21,15 @@ jobs:
             race: '-race'
           - knobs: eviction
             race: '-race'
+          - knobs: eviction-only
+            race: '-race'
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
       - name: Set production knobs
-        if: matrix.knobs != 'off'
+        if: matrix.knobs == 'production' || matrix.knobs == 'eviction'
         run: |
           cat >> "$GITHUB_ENV" <<'EOF'
           NATS_BENCH_TLS_COLLAPSE=1
@@ -42,7 +44,7 @@ jobs:
           NATS_BENCH_INTERN=1
           EOF
       - name: Set eviction knob
-        if: matrix.knobs == 'eviction'
+        if: matrix.knobs == 'eviction' || matrix.knobs == 'eviction-only'
         run: echo 'NATS_BENCH_EVICT_BATCH=64' >> "$GITHUB_ENV"
       - name: Test
         run: go test ./server -run 'Schedul|MemStore|JetStreamBatch|JetStreamAtomicBatch|Stream.*Limit|Consumer.*Pending|LimitEviction|HdrIndex|MsgIndex|Slab|TLS|JetStreamConsumer|JetStreamCluster.*(Consumer|Ack|Pending|Leafnode)' ${{ matrix.race }} -count=1 -timeout 60m
