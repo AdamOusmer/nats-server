@@ -5193,3 +5193,21 @@ func TestClientMsgsMetric(t *testing.T) {
 		t.Fatalf("Did not get expected outClientMsg/Bytes for message sent on qsub")
 	}
 }
+
+func TestTLSJoinOutboundLimit(t *testing.T) {
+	for _, size := range []int{1024, 4 * 1024 * 1024, 4*1024*1024 + 1} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			bufs := net.Buffers{bytes.Repeat([]byte("a"), size-1), []byte("b")}
+			joined := joinOutbound(bufs)
+			if size > 4*1024*1024 {
+				require_Len(t, len(joined), 2)
+				require_True(t, &joined[0][0] == &bufs[0][0])
+				return
+			}
+			require_Len(t, len(joined), 1)
+			require_Equal(t, len(joined[0]), size)
+			require_True(t, bytes.Equal(joined[0][:size-1], bufs[0]))
+			require_Equal(t, joined[0][size-1], 'b')
+		})
+	}
+}

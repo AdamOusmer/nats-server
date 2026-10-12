@@ -1763,6 +1763,9 @@ func (c *client) collapsePtoNB() (net.Buffers, int64) {
 func joinOutbound(bufs net.Buffers) net.Buffers {
 	var n int
 	for _, buf := range bufs {
+		if len(buf) > 4*1024*1024-n {
+			return bufs
+		}
 		n += len(buf)
 	}
 	joined := make([]byte, 0, n)
