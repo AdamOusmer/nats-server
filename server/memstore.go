@@ -1288,14 +1288,10 @@ func (ms *memStore) enforceBytesLimit() {
 }
 
 // evictHeadBatchLocked removes the oldest messages until the store is under
-// MaxBytes and then benchEvictBatch more, so the next appends do not evict.
-// The per-message path drops the lock for the storage callback on every
-// removal and churns dmap; here the removals are counted and reported in one
-// callback by the caller after unlocking (see takeEvictedLocked). Consumers
-// then recompute their pending counts once, as after a purge.
+// MaxBytes, reporting one combined storage callback after unlocking.
 // Lock should be held.
 func (ms *memStore) evictHeadBatchLocked() {
-	extra, limit := benchEvictBatch, uint64(ms.cfg.MaxBytes)
+	limit := uint64(ms.cfg.MaxBytes)
 	var n, bytes uint64
 	oldFirst, last := ms.state.FirstSeq, ms.state.LastSeq
 	seq := oldFirst
@@ -1305,11 +1301,7 @@ func (ms *memStore) evictHeadBatchLocked() {
 			continue
 		}
 		if ms.state.Bytes <= limit {
-			// Under the limit, never trim the message just stored.
-			if extra <= 0 || seq == last {
-				break
-			}
-			extra--
+			break
 		}
 		size := min(memStoreMsgSize(sm.subj, sm.hdr, sm.msg), ms.state.Bytes)
 		if ms.state.Msgs > 0 {

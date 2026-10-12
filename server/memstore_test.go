@@ -97,9 +97,6 @@ func TestMemStoreMsgLimit(t *testing.T) {
 }
 
 func TestMemStoreBytesLimit(t *testing.T) {
-	if benchEvictBatch > 0 {
-		t.Skip("NATS_BENCH_EVICT_BATCH trims below the limit on purpose, see TestMemStoreEvictHeadBatch")
-	}
 	subj, msg := "foo", make([]byte, 512)
 	storedMsgSize := memStoreMsgSize(subj, nil, msg)
 

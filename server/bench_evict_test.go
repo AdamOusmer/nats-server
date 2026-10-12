@@ -17,7 +17,7 @@ import "testing"
 
 func TestMemStoreEvictHeadBatch(t *testing.T) {
 	defer func(old int) { benchEvictBatch = old }(benchEvictBatch)
-	benchEvictBatch = 8
+	benchEvictBatch = 64
 
 	subj, msg := "foo", make([]byte, 512)
 	size := memStoreMsgSize(subj, nil, msg)
@@ -59,26 +59,38 @@ func TestMemStoreEvictHeadBatch(t *testing.T) {
 	_, _, err = ms.StoreMsg(subj, nil, msg, 0)
 	require_NoError(t, err)
 	state = ms.State()
-	// Over by one: evict one to get under, then eight more.
-	require_Equal(t, state.Msgs, limit-8)
-	require_Equal(t, state.Bytes, size*(limit-8))
+	// Over by one: evict only enough to reach the byte limit.
+	require_Equal(t, state.Msgs, limit)
+	require_Equal(t, state.Bytes, size*limit)
 	require_Equal(t, removals, 1)
 	require_Equal(t, lastSeq, 0)
-	require_Equal(t, state.FirstSeq, 11)
-	require_Equal(t, state.NumDeleted, 0)
+	require_Equal(t, state.FirstSeq, 2)
+	require_Equal(t, state.NumDeleted, 1)
 	require_Equal(t, uint64(cbMsgs), state.Msgs)
 	require_Equal(t, uint64(cbBytes), state.Bytes)
 	require_Equal(t, ms.SubjectsTotals(subj)[subj], state.Msgs)
 
-	// The next appends fit under the limit without evicting.
+	// Each append keeps the store exactly full.
 	for i := 0; i < 8; i++ {
 		_, _, err = ms.StoreMsg(subj, nil, msg, 0)
 		require_NoError(t, err)
 	}
-	require_Equal(t, removals, 1)
+	require_Equal(t, removals, 9)
 	require_Equal(t, ms.State().Msgs, limit)
+	require_Equal(t, ms.State().FirstSeq, 11)
+	require_Equal(t, ms.State().NumDeleted, 0)
 
-	// Fewer messages than the batch: the extra trim stops at the newest one.
+	// Lowering the limit removes several messages in a single callback.
+	removals = 0
+	require_NoError(t, ms.UpdateConfig(&StreamConfig{Storage: MemoryStorage, MaxBytes: int64(size * 90)}))
+	state = ms.State()
+	require_Equal(t, removals, 1)
+	require_Equal(t, state.Msgs, 90)
+	require_Equal(t, state.Bytes, size*90)
+	require_Equal(t, uint64(cbMsgs), state.Msgs)
+	require_Equal(t, uint64(cbBytes), state.Bytes)
+
+	// Small stores also retain every message that fits.
 	small, err := newMemStore(&StreamConfig{Storage: MemoryStorage, MaxBytes: int64(3 * size)})
 	require_NoError(t, err)
 	defer small.Stop()
@@ -87,7 +99,7 @@ func TestMemStoreEvictHeadBatch(t *testing.T) {
 		require_NoError(t, err)
 	}
 	state = small.State()
-	require_Equal(t, state.Msgs, 1)
-	require_Equal(t, state.FirstSeq, 4)
+	require_Equal(t, state.Msgs, 3)
+	require_Equal(t, state.FirstSeq, 2)
 	require_Equal(t, state.LastSeq, 4)
 }
