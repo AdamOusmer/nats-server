@@ -1841,6 +1841,9 @@ func (ms *memStore) compact(seq uint64) (uint64, error) {
 		ms.dmap.Empty()
 		ms.sdm.empty()
 	}
+	if r, ok := ms.msgs.(*ringMsgIndex); ok {
+		r.shrink()
+	}
 	ms.mu.Unlock()
 
 	if cb != nil {
@@ -1926,6 +1929,9 @@ func (ms *memStore) Truncate(seq uint64) error {
 	ms.state.Bytes -= bytes
 
 	cb := ms.scb
+	if r, ok := ms.msgs.(*ringMsgIndex); ok {
+		r.shrink()
+	}
 	ms.mu.Unlock()
 
 	if cb != nil {

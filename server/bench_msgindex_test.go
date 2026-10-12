@@ -14,6 +14,7 @@
 package server
 
 import (
+	"fmt"
 	"math/rand"
 	"testing"
 )
@@ -85,5 +86,45 @@ func TestMsgIndexRingMatchesMap(t *testing.T) {
 	}
 	if sm, ok := ms.idxget(1); !ok || sm.seq != 1 {
 		t.Fatal("lost the survivor")
+	}
+}
+
+func TestMsgIndexRingTruncateAndCompact(t *testing.T) {
+	defer func(old bool) { benchRingIndex = old }(benchRingIndex)
+	benchRingIndex = true
+	for _, truncate := range []bool{true, false} {
+		t.Run(fmt.Sprintf("truncate=%t", truncate), func(t *testing.T) {
+			ms, err := newMemStore(&StreamConfig{Storage: MemoryStorage})
+			require_NoError(t, err)
+			defer ms.Stop()
+			for range 4 * ringMinSize {
+				_, _, err := ms.StoreMsg("a", nil, nil, 0)
+				require_NoError(t, err)
+			}
+			r := ms.msgs.(*ringMsgIndex)
+			require_Equal(t, len(r.buf), 4*ringMinSize)
+			if truncate {
+				require_NoError(t, ms.Truncate(16))
+				require_Equal(t, r.hi, 16)
+			} else {
+				_, err = ms.Compact(4*ringMinSize - 15)
+				require_NoError(t, err)
+				require_Equal(t, r.base, 4*ringMinSize-15)
+				require_Equal(t, r.hi, 4*ringMinSize)
+			}
+			require_Equal(t, len(r.buf), ringMinSize)
+			for seq := r.base; r.n > 0; seq++ {
+				_, err = ms.RemoveMsg(seq)
+				require_NoError(t, err)
+			}
+			require_Equal(t, r.base, 0)
+			require_Equal(t, r.hi, 0)
+			r.set(1, &StoreMsg{seq: 1})
+			require_Equal(t, r.hi, 1)
+			require_Equal(t, len(r.buf), ringMinSize)
+			ms.idxset(1_000_000, &StoreMsg{seq: 1_000_000})
+			_, ok := ms.msgs.(mapMsgIndex)
+			require_True(t, ok)
+		})
 	}
 }

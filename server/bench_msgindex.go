@@ -61,7 +61,7 @@ type ringMsgIndex struct {
 	buf  []*StoreMsg
 	mask uint64
 	base uint64 // Lowest live sequence, valid when n > 0.
-	hi   uint64 // Highest sequence set since the ring was last empty.
+	hi   uint64 // Highest live sequence, valid when n > 0.
 	n    int
 }
 
@@ -111,7 +111,11 @@ func (r *ringMsgIndex) set(seq uint64, sm *StoreMsg) {
 }
 
 func (r *ringMsgIndex) grow() {
-	nbuf := make([]*StoreMsg, 2*len(r.buf))
+	r.resize(2 * len(r.buf))
+}
+
+func (r *ringMsgIndex) resize(size int) {
+	nbuf := make([]*StoreMsg, size)
 	nmask := uint64(len(nbuf) - 1)
 	for _, sm := range r.buf {
 		if sm != nil {
@@ -131,11 +135,33 @@ func (r *ringMsgIndex) del(seq uint64) {
 	}
 	*slot = nil
 	if r.n--; r.n == 0 {
+		r.base, r.hi = 0, 0
+		if len(r.buf) > ringMinSize {
+			r.resize(ringMinSize)
+		}
 		return
+	}
+	if seq == r.hi {
+		for r.buf[r.hi&r.mask] == nil {
+			r.hi--
+		}
 	}
 	for seq == r.base && r.buf[r.base&r.mask] == nil {
 		r.base++
 		seq++
+	}
+}
+
+func (r *ringMsgIndex) shrink() {
+	if r.n == 0 {
+		return
+	}
+	size := ringMinSize
+	for uint64(size) <= r.hi-r.base {
+		size *= 2
+	}
+	if size < len(r.buf) {
+		r.resize(size)
 	}
 }
 
