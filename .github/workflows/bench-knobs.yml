@@ -16,7 +16,7 @@ jobs:
       matrix:
         include:
           - knobs: 'off'
-            race: ''
+            race: '-race'
           - knobs: production
             race: '-race'
           - knobs: eviction
