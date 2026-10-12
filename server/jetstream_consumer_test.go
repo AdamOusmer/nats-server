@@ -14269,19 +14269,35 @@ func TestJetStreamConsumerPendingRemovalTerminationOnce(t *testing.T) {
 	}
 }
 
+func waitForConsumerDeliveryIdle(t *testing.T) {
+	t.Helper()
+	checkFor(t, time.Second, time.Millisecond, func() error {
+		buf := make([]byte, 64*1024)
+		n := runtime.Stack(buf, true)
+		for _, stack := range bytes.Split(buf[:n], []byte("\n\n")) {
+			if bytes.Contains(stack, []byte("[select]")) && bytes.Contains(stack, []byte("(*consumer).loopAndGatherMsgs(")) {
+				return nil
+			}
+		}
+		return errors.New("delivery loop is not waiting in select")
+	})
+}
+
 func TestJetStreamConsumerPendingRemovalDeliveryIdle(t *testing.T) {
 	o, store, q := newConsumerPendingRemovalTest(t, MemoryStorage)
-	o.mu.Lock()
-	_, err := store.RemoveMsg(5)
-	require_NoError(t, err)
-	require_True(t, o.rmQueued.Load())
 	qch, done := make(chan struct{}), make(chan struct{})
 	go func() {
 		o.loopAndGatherMsgs(qch)
 		close(done)
 	}()
-	o.mu.Unlock()
 	defer func() { close(qch); <-done }()
+	waitForConsumerDeliveryIdle(t)
+	o.mu.Lock()
+	_, err := store.RemoveMsg(5)
+	queued := o.rmQueued.Load()
+	o.mu.Unlock()
+	require_NoError(t, err)
+	require_True(t, queued)
 	checkFor(t, time.Second, time.Millisecond, func() error {
 		o.mu.Lock()
 		defer o.mu.Unlock()
@@ -14291,6 +14307,38 @@ func TestJetStreamConsumerPendingRemovalDeliveryIdle(t *testing.T) {
 		return nil
 	})
 	require_Equal(t, q.len(), 1)
+}
+
+func TestJetStreamConsumerPendingRemovalClosed(t *testing.T) {
+	for _, path := range []string{"queued", "terminating", "closed"} {
+		t.Run(path, func(t *testing.T) {
+			o, store, q := newConsumerPendingRemovalTest(t, MemoryStorage)
+			o.mu.Lock()
+			_, err := store.RemoveMsg(5)
+			if path == "terminating" {
+				o.applyQueuedRemovalsLocked()
+			}
+			o.closed = true
+			if path == "closed" {
+				o.terminateStreamPendingLocked(5, o.pending[5], 1)
+			}
+			o.releaseDeliveryLock()
+			require_NoError(t, err)
+			if path != "terminating" {
+				require_True(t, o.rmQueued.Load())
+			}
+			o.loopAndGatherMsgs(make(chan struct{}))
+			checkFor(t, time.Second, time.Millisecond, func() error {
+				o.mu.Lock()
+				defer o.mu.Unlock()
+				if len(o.rmTerm) != 0 {
+					return errors.New("termination has not finished")
+				}
+				return nil
+			})
+			require_Equal(t, q.len(), 0)
+		})
+	}
 }
 
 type ackNoneCursorTestNode struct {
@@ -14310,6 +14358,11 @@ func TestJetStreamConsumerAckNoneCursorFlush(t *testing.T) {
 		t.Run(retention.String(), func(t *testing.T) {
 			n := &ackNoneCursorTestNode{}
 			o := &consumer{node: n, retention: retention, cfg: ConsumerConfig{AckPolicy: AckNone}}
+			o.mu.Lock()
+			defer func() {
+				stopAndClearTimer(&o.ackNoneTimer)
+				o.mu.Unlock()
+			}()
 			o.updateDelivered(1, 101, 1, 123)
 			if retention == LimitsPolicy {
 				require_True(t, o.phead == nil)
@@ -14345,25 +14398,162 @@ func TestJetStreamConsumerAckNoneCursorFlush(t *testing.T) {
 	}
 }
 
+func TestJetStreamConsumerAckNoneCursorTimer(t *testing.T) {
+	defer func(every uint64, delay time.Duration) {
+		benchAckNoneEvery, benchProposeCoalesce = every, delay
+	}(benchAckNoneEvery, benchProposeCoalesce)
+	benchProposeCoalesce = 0
+	for _, path := range []string{"disabled", "closed", "follower"} {
+		t.Run(path, func(t *testing.T) {
+			benchAckNoneEvery = 64
+			if path == "disabled" {
+				benchAckNoneEvery = 0
+			}
+			o := &consumer{node: &ackNoneCursorTestNode{}, retention: LimitsPolicy, cfg: ConsumerConfig{AckPolicy: AckNone}}
+			o.leader.Store(true)
+			o.mu.Lock()
+			o.updateDelivered(1, 101, 1, 123)
+			if path == "disabled" {
+				require_True(t, o.ackNoneTimer == nil && len(o.ackNoneCursor) == 0 && o.phead != nil)
+				o.mu.Unlock()
+				return
+			}
+			require_NotNil(t, o.ackNoneTimer)
+			if path == "closed" {
+				o.closed = true
+			} else {
+				o.leader.Store(false)
+			}
+			o.mu.Unlock()
+			checkFor(t, time.Second, time.Millisecond, func() error {
+				o.mu.Lock()
+				defer o.mu.Unlock()
+				if o.ackNoneTimer != nil {
+					return errors.New("cursor timer has not fired")
+				}
+				return nil
+			})
+			o.mu.Lock()
+			defer o.mu.Unlock()
+			require_True(t, o.phead == nil)
+		})
+	}
+}
+
 func TestJetStreamConsumerAckNoneCursorDeliveryIdle(t *testing.T) {
 	defer func(old uint64) { benchAckNoneEvery = old }(benchAckNoneEvery)
 	benchAckNoneEvery = 64
-	o, _, _ := newConsumerPendingRemovalTest(t, MemoryStorage)
-	o.cfg.AckPolicy = AckNone
-	o.node = &ackNoneCursorTestNode{}
-	o.updateDelivered(1, 1, 1, 123)
+	ms, err := newMemStore(&StreamConfig{Name: "TEST", Storage: MemoryStorage})
+	require_NoError(t, err)
+	defer ms.Stop()
+	s := &Server{opts: DefaultOptions()}
+	q := &jsOutQ{newIPQueue[*jsPubMsg](s, "AckNone deliveries")}
+	defer q.unregister()
+	o := &consumer{
+		srv: s, mset: &stream{store: ms, cfg: StreamConfig{Name: "TEST"}}, outq: q,
+		cfg:       ConsumerConfig{AckPolicy: AckNone, DeliverSubject: "deliver"},
+		retention: LimitsPolicy, sseq: 1, dseq: 1, active: true,
+		mch: make(chan struct{}), node: &ackNoneCursorTestNode{},
+	}
+	o.leader.Store(true)
 	qch, done := make(chan struct{}), make(chan struct{})
 	go func() {
 		o.loopAndGatherMsgs(qch)
 		close(done)
 	}()
-	defer func() { close(qch); <-done }()
+	defer func() {
+		close(qch)
+		<-done
+		o.mu.Lock()
+		stopAndClearTimer(&o.ackNoneTimer)
+		o.mu.Unlock()
+	}()
+	const total = 1000
+	for i := 0; i < total; i++ {
+		seq, _, err := ms.StoreMsg("a", nil, nil, 0)
+		require_NoError(t, err)
+		o.processStreamSignal(seq)
+		// The unbuffered signal waits for the loop to reach its idle select.
+		select {
+		case o.mch <- struct{}{}:
+		case <-time.After(time.Second):
+			t.Fatal("delivery loop did not become idle")
+		}
+		select {
+		case <-q.ch:
+		case <-time.After(time.Second):
+			t.Fatal("message was not delivered")
+		}
+		msg, _ := q.popOne()
+		require_NotNil(t, msg)
+		msg.returnToPool()
+	}
 	checkFor(t, time.Second, time.Millisecond, func() error {
 		o.mu.Lock()
 		defer o.mu.Unlock()
-		if o.phead == nil || len(o.ackNoneCursor) != 0 {
+		if len(o.ackNoneCursor) != 0 || o.ptail == nil {
 			return errors.New("idle cursor was not proposed")
+		}
+		dseq, sseq, _, _, err := decodeDeliveredUpdate(o.ptail.data[1:])
+		if err != nil || dseq != total || sseq != total {
+			return fmt.Errorf("last cursor: delivered %d, stream %d, error %v", dseq, sseq, err)
 		}
 		return nil
 	})
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	var proposals int
+	for p := o.phead; p != nil; p = p.next {
+		if p.data[0] == byte(updateDeliveredOp) {
+			proposals++
+		}
+	}
+	// Allow four times the count-based proposals for timer flushes between deliveries.
+	if limit := total / int(benchAckNoneEvery/4); proposals > limit {
+		t.Fatalf("expected at most %d cursor proposals, got %d", limit, proposals)
+	}
+	t.Logf("%d synchronous deliveries produced %d cursor proposals", total, proposals)
+}
+
+func (n *ackNoneCursorTestNode) Stop() {}
+
+func TestJetStreamConsumerAckNoneCursorLeaderAndStop(t *testing.T) {
+	defer func(every uint64, delay time.Duration) {
+		benchAckNoneEvery, benchProposeCoalesce = every, delay
+	}(benchAckNoneEvery, benchProposeCoalesce)
+	benchAckNoneEvery, benchProposeCoalesce = 64, 20*time.Millisecond
+	for _, path := range []string{"leader", "stop"} {
+		t.Run(path, func(t *testing.T) {
+			s := &Server{opts: DefaultOptions(), gateway: &srvGateway{}}
+			n := &ackNoneCursorTestNode{}
+			o := &consumer{srv: s, node: n, retention: LimitsPolicy, cfg: ConsumerConfig{AckPolicy: AckNone, DeliverSubject: "deliver"}}
+			o.leader.Store(true)
+			o.mu.Lock()
+			o.updateDelivered(1, 101, 1, 123)
+			require_NotNil(t, o.ackNoneTimer)
+			o.mu.Unlock()
+			if path == "leader" {
+				require_NoError(t, o.setLeader(false, 2))
+			} else {
+				o.mu.Lock()
+				o.cfg.DeliverSubject = _EMPTY_
+				o.mu.Unlock()
+				require_NoError(t, o.stopWithFlags(false, false, false, false))
+			}
+			o.mu.Lock()
+			require_Len(t, len(n.forwarded), 1)
+			require_Len(t, len(o.ackNoneCursor), 0)
+			require_True(t, o.ackNoneTimer == nil && o.phead == nil)
+			dseq, sseq, _, _, err := decodeDeliveredUpdate(n.forwarded[0][1:])
+			o.mu.Unlock()
+			require_NoError(t, err)
+			require_Equal(t, dseq, 1)
+			require_Equal(t, sseq, 101)
+			time.Sleep(2 * benchProposeCoalesce)
+			o.mu.Lock()
+			defer o.mu.Unlock()
+			require_Len(t, len(n.forwarded), 1)
+			require_True(t, o.phead == nil)
+		})
+	}
 }

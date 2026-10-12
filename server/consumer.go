@@ -574,6 +574,7 @@ type consumer struct {
 	rmTerm   map[uint64]*Pending
 
 	ackNoneCursor []byte
+	ackNoneTimer  *time.Timer
 }
 
 // A single subject filter.
@@ -1673,6 +1674,9 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 	mset, closed := o.mset, o.closed
 	if o.isLeader() {
 		o.flushAckNoneCursorLocked(true)
+	}
+	if !isLeader {
+		stopAndClearTimer(&o.ackNoneTimer)
 	}
 	wasLeader := o.leader.Swap(isLeader)
 
@@ -3102,8 +3106,24 @@ func (o *consumer) updateDelivered(dseq, sseq, dc uint64, ts int64) {
 		n += binary.PutVarint(b[n:], ts)
 		if benchAckNoneEvery > 1 && o.cfg.AckPolicy == AckNone && o.retention == LimitsPolicy && dseq%benchAckNoneEvery != 0 {
 			o.ackNoneCursor = append(o.ackNoneCursor[:0], b[:n]...)
+			if o.ackNoneTimer == nil {
+				var t *time.Timer
+				t = time.AfterFunc(max(benchProposeCoalesce, 2*time.Millisecond), func() {
+					o.mu.Lock()
+					defer o.mu.Unlock()
+					if o.ackNoneTimer != t {
+						return
+					}
+					o.ackNoneTimer = nil
+					if !o.closed && o.isLeader() {
+						o.flushAckNoneCursorLocked(false)
+					}
+				})
+				o.ackNoneTimer = t
+			}
 		} else {
 			o.ackNoneCursor = nil
+			stopAndClearTimer(&o.ackNoneTimer)
 			o.propose(b[:n])
 		}
 	} else if o.store != nil {
@@ -3113,8 +3133,9 @@ func (o *consumer) updateDelivered(dseq, sseq, dc uint64, ts int64) {
 	o.ldt = time.Now()
 }
 
-// Lock should be held. Forward the final cursor when leadership has already changed.
+// Lock should be held. Forward the final cursor on leadership loss or shutdown.
 func (o *consumer) flushAckNoneCursorLocked(forward bool) {
+	stopAndClearTimer(&o.ackNoneTimer)
 	if len(o.ackNoneCursor) == 0 {
 		return
 	}
@@ -3372,6 +3393,10 @@ func (o *consumer) processTermLocked(sseq, dseq, dc uint64, reason, reply string
 	if needLock {
 		o.mu.Lock()
 		defer o.mu.Unlock()
+	}
+
+	if o.closed {
+		return ackedInPlace
 	}
 
 	// Deliver an advisory
@@ -5625,7 +5650,6 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		continue
 
 	waitForMsgs:
-		o.flushAckNoneCursorLocked(false)
 		// If we were in a replay state check to see if we are caught up. If so clear.
 		if o.replay && o.sseq > lseq {
 			o.replay = false
@@ -5681,7 +5705,9 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 
 // Lock should be held.
 func (o *consumer) releaseDeliveryLock() {
-	o.applyQueuedRemovalsLocked()
+	if !o.closed && o.mset != nil {
+		o.applyQueuedRemovalsLocked()
+	}
 	o.mu.Unlock()
 }
 
@@ -7158,6 +7184,9 @@ func (o *consumer) applyStreamRemovalsLocked(q []streamRemoval) {
 
 // Lock should be held.
 func (o *consumer) terminateStreamPendingLocked(seq uint64, p *Pending, dc uint64) {
+	if o.closed {
+		return
+	}
 	if o.rmTerm == nil {
 		o.rmTerm = make(map[uint64]*Pending)
 	}
