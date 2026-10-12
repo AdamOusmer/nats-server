@@ -14102,16 +14102,20 @@ func TestJetStreamConsumerPendingRemovalQueue(t *testing.T) {
 				checkFor(t, time.Second, time.Millisecond, func() error {
 					o.mu.Lock()
 					defer o.mu.Unlock()
-					if policy != AckNone && q.len() != 10 {
+					if !batch && policy != AckNone && q.len() != 10 {
 						return fmt.Errorf("expected 10 advisories, got %d", q.len())
 					}
-					if len(o.pending) != 0 || len(o.rmTerm) != 0 {
+					wantPending := 0
+					if batch && policy != AckNone {
+						wantPending = 10
+					}
+					if len(o.pending) != wantPending || len(o.rmTerm) != 0 {
 						return fmt.Errorf("pending %d, terminating %d", len(o.pending), len(o.rmTerm))
 					}
 					return nil
 				})
 				var want int
-				if policy != AckNone {
+				if !batch && policy != AckNone {
 					want = 10
 				}
 				msgs := q.pop()
@@ -14128,4 +14132,238 @@ func TestJetStreamConsumerPendingRemovalQueue(t *testing.T) {
 			})
 		}
 	}
+}
+
+func newConsumerPendingRemovalTest(t *testing.T, storage StorageType) (*consumer, StreamStore, *jsOutQ) {
+	t.Helper()
+	cfg := StreamConfig{Name: "TEST", Storage: storage}
+	var store StreamStore
+	var err error
+	if storage == MemoryStorage {
+		store, err = newMemStore(&cfg)
+	} else {
+		store, err = newFileStore(FileStoreConfig{StoreDir: t.TempDir()}, cfg)
+	}
+	require_NoError(t, err)
+	t.Cleanup(func() { store.Stop() })
+	for range 100 {
+		_, _, err := store.StoreMsg("a", nil, nil, 0)
+		require_NoError(t, err)
+	}
+	s := &Server{opts: DefaultOptions()}
+	q := &jsOutQ{newIPQueue[*jsPubMsg](s, "removal advisories")}
+	t.Cleanup(q.unregister)
+	mset := &stream{store: store, cfg: cfg}
+	o := &consumer{
+		srv: s, acc: &Account{}, mset: mset, outq: q,
+		cfg:       ConsumerConfig{AckPolicy: AckExplicit, AckWait: time.Hour, DeliverSubject: "deliver"},
+		retention: LimitsPolicy, sseq: 11, dseq: 11, npc: 90, npf: 100,
+		pending: make(map[uint64]*Pending), rdc: map[uint64]uint64{1: 1, 50: 1},
+		mch: make(chan struct{}, 1), maxp: 10,
+	}
+	o.leader.Store(true)
+	for seq := uint64(1); seq <= 10; seq++ {
+		o.pending[seq] = &Pending{Sequence: seq}
+	}
+	mset.cList = []*consumer{o}
+	store.RegisterStorageUpdates(mset.storeUpdates)
+	return o, store, q
+}
+
+func TestJetStreamConsumerPendingBulkRemovalSemantics(t *testing.T) {
+	defer func(old int) { benchEvictBatch = old }(benchEvictBatch)
+	for _, knob := range []int{0, 64} {
+		benchEvictBatch = knob
+		for _, storage := range []StorageType{MemoryStorage, FileStorage} {
+			for _, op := range []string{"purge", "compact", "truncate", "truncate-zero", "purge-ex", "reset"} {
+				if op == "reset" && storage != MemoryStorage {
+					continue
+				}
+				t.Run(fmt.Sprintf("knob=%d/storage=%s/%s", knob, storage, op), func(t *testing.T) {
+					o, store, q := newConsumerPendingRemovalTest(t, storage)
+					remove := func() error {
+						switch op {
+						case "purge":
+							_, err := store.Purge()
+							return err
+						case "compact":
+							_, err := store.Compact(41)
+							return err
+						case "truncate":
+							return store.Truncate(5)
+						case "truncate-zero":
+							return store.Truncate(0)
+						case "purge-ex":
+							_, err := store.PurgeEx("a", 41, 0)
+							return err
+						default:
+							return store.(*memStore).reset()
+						}
+					}
+					o.mu.Lock()
+					done := make(chan error, 1)
+					go func() { done <- remove() }()
+					select {
+					case err := <-done:
+						o.mu.Unlock()
+						require_NoError(t, err)
+					case <-time.After(time.Second):
+						o.mu.Unlock()
+						<-done
+						t.Fatal("bulk removal waited for consumer lock")
+					}
+					o.mu.Lock()
+					o.applyQueuedRemovalsLocked()
+					npc, _, err := o.calculateNumPending()
+					got := o.npc
+					pending, terminating := len(o.pending), len(o.rmTerm)
+					var ss StreamState
+					store.FastState(&ss)
+					for seq := range o.rdc {
+						if seq < ss.FirstSeq {
+							t.Errorf("redelivery %d below first %d", seq, ss.FirstSeq)
+						}
+					}
+					o.mu.Unlock()
+					require_NoError(t, err)
+					require_Equal(t, got, int64(npc))
+					require_Equal(t, pending, 10)
+					require_Equal(t, terminating, 0)
+					require_Equal(t, q.len(), 0)
+					require_False(t, o.rmQueued.Load())
+				})
+			}
+		}
+	}
+}
+
+func TestJetStreamConsumerPendingRemovalTerminationOnce(t *testing.T) {
+	o, store, q := newConsumerPendingRemovalTest(t, MemoryStorage)
+	o.mu.Lock()
+	_, err := store.RemoveMsg(5)
+	o.applyQueuedRemovalsLocked()
+	// Keep the lock across drains so the first termination cannot finish yet.
+	o.streamRemovedBelow(11)
+	o.applyQueuedRemovalsLocked()
+	o.streamRemovedBelow(11)
+	o.applyQueuedRemovalsLocked()
+	o.mu.Unlock()
+	require_NoError(t, err)
+	checkFor(t, time.Second, time.Millisecond, func() error {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if len(o.pending) != 0 || len(o.rmTerm) != 0 {
+			return fmt.Errorf("pending %d, terminating %d", len(o.pending), len(o.rmTerm))
+		}
+		return nil
+	})
+	msgs := q.pop()
+	require_Len(t, len(msgs), 10)
+	seen := make(map[uint64]bool)
+	for _, msg := range msgs {
+		var e JSConsumerDeliveryTerminatedAdvisory
+		require_NoError(t, json.Unmarshal(msg.msg, &e))
+		require_False(t, seen[e.StreamSeq])
+		seen[e.StreamSeq] = true
+		msg.returnToPool()
+	}
+}
+
+func TestJetStreamConsumerPendingRemovalDeliveryIdle(t *testing.T) {
+	o, store, q := newConsumerPendingRemovalTest(t, MemoryStorage)
+	o.mu.Lock()
+	_, err := store.RemoveMsg(5)
+	require_NoError(t, err)
+	require_True(t, o.rmQueued.Load())
+	qch, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		o.loopAndGatherMsgs(qch)
+		close(done)
+	}()
+	o.mu.Unlock()
+	defer func() { close(qch); <-done }()
+	checkFor(t, time.Second, time.Millisecond, func() error {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if len(o.pending) != 9 || len(o.rmTerm) != 0 || o.rmQueued.Load() {
+			return fmt.Errorf("pending %d, queued %t", len(o.pending), o.rmQueued.Load())
+		}
+		return nil
+	})
+	require_Equal(t, q.len(), 1)
+}
+
+type ackNoneCursorTestNode struct {
+	RaftNode
+	forwarded [][]byte
+}
+
+func (n *ackNoneCursorTestNode) ForwardProposal(entry []byte) error {
+	n.forwarded = append(n.forwarded, append([]byte(nil), entry...))
+	return nil
+}
+
+func TestJetStreamConsumerAckNoneCursorFlush(t *testing.T) {
+	defer func(old uint64) { benchAckNoneEvery = old }(benchAckNoneEvery)
+	benchAckNoneEvery = 64
+	for _, retention := range []RetentionPolicy{LimitsPolicy, InterestPolicy, WorkQueuePolicy} {
+		t.Run(retention.String(), func(t *testing.T) {
+			n := &ackNoneCursorTestNode{}
+			o := &consumer{node: n, retention: retention, cfg: ConsumerConfig{AckPolicy: AckNone}}
+			o.updateDelivered(1, 101, 1, 123)
+			if retention == LimitsPolicy {
+				require_True(t, o.phead == nil)
+				o.flushAckNoneCursorLocked(false)
+			}
+			require_NotNil(t, o.phead)
+			dseq, sseq, dc, ts, err := decodeDeliveredUpdate(o.phead.data[1:])
+			require_NoError(t, err)
+			require_Equal(t, dseq, 1)
+			require_Equal(t, sseq, 101)
+			require_Equal(t, dc, 1)
+			require_Equal(t, ts, 123)
+			require_Len(t, len(o.ackNoneCursor), 0)
+			if retention != LimitsPolicy {
+				return
+			}
+			o.updateDelivered(2, 102, 1, 124)
+			o.flushAckNoneCursorLocked(true)
+			require_Len(t, len(n.forwarded), 1)
+			dseq, sseq, _, _, err = decodeDeliveredUpdate(n.forwarded[0][1:])
+			require_NoError(t, err)
+			require_Equal(t, dseq, 2)
+			require_Equal(t, sseq, 102)
+			o.flushAckNoneCursorLocked(true)
+			require_Len(t, len(n.forwarded), 1)
+			o.updateDelivered(63, 163, 1, 125)
+			o.updateDelivered(64, 164, 1, 126)
+			require_Len(t, len(o.ackNoneCursor), 0)
+			dseq, _, _, _, err = decodeDeliveredUpdate(o.ptail.data[1:])
+			require_NoError(t, err)
+			require_Equal(t, dseq, 64)
+		})
+	}
+}
+
+func TestJetStreamConsumerAckNoneCursorDeliveryIdle(t *testing.T) {
+	defer func(old uint64) { benchAckNoneEvery = old }(benchAckNoneEvery)
+	benchAckNoneEvery = 64
+	o, _, _ := newConsumerPendingRemovalTest(t, MemoryStorage)
+	o.cfg.AckPolicy = AckNone
+	o.node = &ackNoneCursorTestNode{}
+	o.updateDelivered(1, 1, 1, 123)
+	qch, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		o.loopAndGatherMsgs(qch)
+		close(done)
+	}()
+	defer func() { close(qch); <-done }()
+	checkFor(t, time.Second, time.Millisecond, func() error {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if o.phead == nil || len(o.ackNoneCursor) != 0 {
+			return errors.New("idle cursor was not proposed")
+		}
+		return nil
+	})
 }

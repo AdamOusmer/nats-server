@@ -572,6 +572,8 @@ type consumer struct {
 	rmq      []streamRemoval
 	rmQueued atomic.Bool
 	rmTerm   map[uint64]*Pending
+
+	ackNoneCursor []byte
 }
 
 // A single subject filter.
@@ -1669,6 +1671,9 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 		return nil
 	}
 	mset, closed := o.mset, o.closed
+	if o.isLeader() {
+		o.flushAckNoneCursorLocked(true)
+	}
 	wasLeader := o.leader.Swap(isLeader)
 
 	// For clustered new consumers, starting seq selection was deferred from
@@ -3085,13 +3090,6 @@ func (o *consumer) propose(entry []byte) {
 
 // Lock should be held.
 func (o *consumer) updateDelivered(dseq, sseq, dc uint64, ts int64) {
-	if o.node != nil && benchAckNoneEvery > 1 && o.cfg.AckPolicy == AckNone && dseq%benchAckNoneEvery != 0 {
-		if o.store != nil {
-			o.store.UpdateDelivered(dseq, sseq, dc, ts)
-		}
-		o.ldt = time.Now()
-		return
-	}
 	// Clustered mode and R>1.
 	if o.node != nil {
 		// Inline for now, use variable compression.
@@ -3102,12 +3100,32 @@ func (o *consumer) updateDelivered(dseq, sseq, dc uint64, ts int64) {
 		n += binary.PutUvarint(b[n:], sseq)
 		n += binary.PutUvarint(b[n:], dc)
 		n += binary.PutVarint(b[n:], ts)
-		o.propose(b[:n])
+		if benchAckNoneEvery > 1 && o.cfg.AckPolicy == AckNone && o.retention == LimitsPolicy && dseq%benchAckNoneEvery != 0 {
+			o.ackNoneCursor = append(o.ackNoneCursor[:0], b[:n]...)
+		} else {
+			o.ackNoneCursor = nil
+			o.propose(b[:n])
+		}
 	} else if o.store != nil {
 		o.store.UpdateDelivered(dseq, sseq, dc, ts)
 	}
 	// Update activity.
 	o.ldt = time.Now()
+}
+
+// Lock should be held. Forward the final cursor when leadership has already changed.
+func (o *consumer) flushAckNoneCursorLocked(forward bool) {
+	if len(o.ackNoneCursor) == 0 {
+		return
+	}
+	if o.node != nil {
+		if forward {
+			o.node.ForwardProposal(o.ackNoneCursor)
+		} else {
+			o.propose(o.ackNoneCursor)
+		}
+	}
+	o.ackNoneCursor = nil
 }
 
 // Used to remember a pending ack reply in a replicated consumer.
@@ -3387,24 +3405,6 @@ func (o *consumer) ackWait(next time.Duration) time.Duration {
 		return next + ackWaitDelay
 	}
 	return o.cfg.AckWait + ackWaitDelay
-}
-
-func (o *consumer) removeRedeliveredBelow(seq uint64) {
-	if seq == 0 {
-		return
-	}
-	o.mu.Lock()
-	for sseq := range o.rdc {
-		if sseq < seq {
-			delete(o.rdc, sseq)
-			o.removeFromRedeliverQueue(sseq)
-		}
-	}
-	o.mu.Unlock()
-
-	if o.store != nil {
-		o.store.RemoveRedeliveredBelow(seq)
-	}
 }
 
 // checkRedelivered drops rdq entries at/below asflr or below stream's first sequence.
@@ -5426,7 +5426,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 	s := o.srv
 	// need to check again if consumer is closed
 	if o.mset == nil {
-		o.mu.Unlock()
+		o.releaseDeliveryLock()
 		return
 	}
 	// For idle heartbeat support.
@@ -5437,7 +5437,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 	}
 	// Interest changes.
 	inch := o.inch
-	o.mu.Unlock()
+	o.releaseDeliveryLock()
 
 	// Grab the stream's retention policy and name
 	mset.cfgMu.RLock()
@@ -5466,7 +5466,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 
 		// consumer is closed when mset is set to nil.
 		if o.closed || o.mset == nil {
-			o.mu.Unlock()
+			o.releaseDeliveryLock()
 			return
 		}
 
@@ -5495,7 +5495,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 
 		// We can release the lock now under getNextMsg so need to check this condition again here.
 		if o.closed || o.mset == nil {
-			o.mu.Unlock()
+			o.releaseDeliveryLock()
 			return
 		}
 
@@ -5572,7 +5572,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		// If we are in a replay scenario and have not caught up check if we need to delay here.
 		if o.replay && lts > 0 {
 			if delay = time.Duration(pmsg.ts - lts); delay > time.Millisecond {
-				o.mu.Unlock()
+				o.releaseDeliveryLock()
 				select {
 				case <-qch:
 					pmsg.returnToPool()
@@ -5593,7 +5593,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			r := o.rlimit.ReserveN(now, sz)
 			delay := r.DelayFrom(now)
 			if delay > 0 {
-				o.mu.Unlock()
+				o.releaseDeliveryLock()
 				select {
 				case <-qch:
 					pmsg.returnToPool()
@@ -5619,12 +5619,13 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		}
 
 		if batched++; benchDeliverBatch <= 1 || batched >= benchDeliverBatch {
-			o.mu.Unlock()
+			o.releaseDeliveryLock()
 			held, batched = false, 0
 		}
 		continue
 
 	waitForMsgs:
+		o.flushAckNoneCursorLocked(false)
 		// If we were in a replay state check to see if we are caught up. If so clear.
 		if o.replay && o.sseq > lseq {
 			o.replay = false
@@ -5646,7 +5647,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 
 		// We will wait here for new messages to arrive.
 		mch, odsubj := o.mch, o.cfg.DeliverSubject
-		o.mu.Unlock()
+		o.releaseDeliveryLock()
 		held, batched = false, 0
 
 		select {
@@ -5661,7 +5662,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		case <-wrExp:
 			o.mu.Lock()
 			o.processWaiting(true)
-			o.mu.Unlock()
+			o.releaseDeliveryLock()
 		case <-hbc:
 			if o.isActive() {
 				o.mu.Lock()
@@ -5670,12 +5671,18 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 				if o.cfg.AckPolicy == AckFlowControl && len(o.pending) > 0 && o.fcid == _EMPTY_ {
 					o.sendFlowControl()
 				}
-				o.mu.Unlock()
+				o.releaseDeliveryLock()
 			}
 			// Reset our idle heartbeat timer.
 			hb.Reset(hbd)
 		}
 	}
+}
+
+// Lock should be held.
+func (o *consumer) releaseDeliveryLock() {
+	o.applyQueuedRemovalsLocked()
+	o.mu.Unlock()
 }
 
 // Lock should be held.
@@ -5752,13 +5759,6 @@ func (o *consumer) checkNumPendingOnEOF() {
 		// We know here we can reset our running state for num pending.
 		o.npc, o.npf = 0, state.LastSeq
 	}
-}
-
-// Call into streamNumPending after acquiring the consumer lock.
-func (o *consumer) streamNumPendingLocked() (uint64, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.streamNumPending()
 }
 
 // Will force a set from the stream store of num pending on the consumer leader.
@@ -6786,6 +6786,7 @@ func (o *consumer) stopWithFlags(dflag, sdflag, doSignal, advisory bool) error {
 		o.mu.Unlock()
 		return nil
 	}
+	o.flushAckNoneCursorLocked(true)
 	o.closed = true
 
 	// Signal to the monitor loop.
@@ -7056,7 +7057,11 @@ func (o *consumer) decStreamPending(sseq uint64, subj string) {
 }
 
 func (o *consumer) streamRemovedBelow(first uint64) {
-	o.processStreamRemoval(streamRemoval{first: first})
+	o.processStreamRemoval(streamRemoval{kind: streamRemovalEviction, first: first})
+}
+
+func (o *consumer) streamRecalculatePending(first uint64) {
+	o.processStreamRemoval(streamRemoval{kind: streamRemovalRecalculate, first: first})
 }
 
 func (o *consumer) processStreamRemoval(r streamRemoval) {
@@ -7066,6 +7071,7 @@ func (o *consumer) processStreamRemoval(r streamRemoval) {
 		o.rmq = append(o.rmq, r)
 		o.rmQueued.Store(true)
 		o.rmMu.Unlock()
+		o.signalNewMessages()
 		return
 	}
 	q := o.takeQueuedRemovalsLocked()
@@ -7077,8 +7083,16 @@ func (o *consumer) processStreamRemoval(r streamRemoval) {
 	o.mu.Unlock()
 }
 
-// streamRemoval describes a single removal or a batch below first.
+type streamRemovalKind uint8
+
+const (
+	streamRemovalSingle streamRemovalKind = iota
+	streamRemovalRecalculate
+	streamRemovalEviction
+)
+
 type streamRemoval struct {
+	kind  streamRemovalKind
 	seq   uint64
 	subj  string
 	first uint64
@@ -7106,25 +7120,19 @@ func (o *consumer) applyQueuedRemovalsLocked() {
 func (o *consumer) applyStreamRemovalsLocked(q []streamRemoval) {
 	var recalculate bool
 	for _, r := range q {
-		if r.first > 0 {
-			recalculate = true
-			if o.rmTerm == nil {
-				o.rmTerm = make(map[uint64]*Pending)
-			}
-			break
-		}
-	}
-	for _, r := range q {
-		if r.first == 0 {
+		if r.kind == streamRemovalSingle {
 			if p, rdc, wasPending := o.decStreamPendingLocked(r.seq, r.subj); wasPending {
 				o.terminateStreamPendingLocked(r.seq, p, rdc)
 			}
 			continue
 		}
+		recalculate = true
 		var seqs []uint64
-		for seq := range o.pending {
-			if seq < r.first {
-				seqs = append(seqs, seq)
+		if r.kind == streamRemovalEviction {
+			for seq := range o.pending {
+				if seq < r.first {
+					seqs = append(seqs, seq)
+				}
 			}
 		}
 		slices.Sort(seqs)
@@ -7138,7 +7146,7 @@ func (o *consumer) applyStreamRemovalsLocked(q []streamRemoval) {
 				o.removeFromRedeliverQueue(seq)
 			}
 		}
-		if o.store != nil {
+		if r.first > 0 && o.store != nil {
 			o.store.RemoveRedeliveredBelow(r.first)
 		}
 	}
@@ -7151,8 +7159,7 @@ func (o *consumer) applyStreamRemovalsLocked(q []streamRemoval) {
 // Lock should be held.
 func (o *consumer) terminateStreamPendingLocked(seq uint64, p *Pending, dc uint64) {
 	if o.rmTerm == nil {
-		go o.processTerm(seq, p.Sequence, dc, ackTermUnackedLimitsReason, _EMPTY_)
-		return
+		o.rmTerm = make(map[uint64]*Pending)
 	}
 	// Overlapping batches can encounter the same pending termination.
 	if o.rmTerm[seq] == p {

@@ -5596,11 +5596,10 @@ func (mset *stream) storeUpdates(md, bd int64, seq uint64, subj string) {
 		mset.store.FastState(&ss)
 		mset.clsMu.RLock()
 		for _, o := range mset.cList {
-			if benchEvictBatch > 0 {
+			if subj == memStoreEvictionSubject {
 				o.streamRemovedBelow(ss.FirstSeq)
 			} else {
-				o.streamNumPendingLocked()
-				o.removeRedeliveredBelow(ss.FirstSeq)
+				o.streamRecalculatePending(ss.FirstSeq)
 			}
 		}
 		mset.clsMu.RUnlock()
@@ -5715,19 +5714,11 @@ func getExpectedLastMsgIdi(hdr []byte, hx *hdrIndex) string {
 }
 
 // Fast lookup of expected stream.
-func getExpectedStream(hdr []byte) string {
-	return getExpectedStreami(hdr, nil)
-}
-
 func getExpectedStreami(hdr []byte, hx *hdrIndex) string {
 	return string(hx.slice(JSExpectedStream, hdr))
 }
 
 // Fast lookup of expected last sequence.
-func getExpectedLastSeq(hdr []byte) (uint64, bool) {
-	return getExpectedLastSeqi(hdr, nil)
-}
-
 func getExpectedLastSeqi(hdr []byte, hx *hdrIndex) (uint64, bool) {
 	bseq := hx.slice(JSExpectedLastSeq, hdr)
 	if len(bseq) == 0 {
@@ -5737,10 +5728,6 @@ func getExpectedLastSeqi(hdr []byte, hx *hdrIndex) (uint64, bool) {
 }
 
 // Fast lookup of rollups.
-func getRollup(hdr []byte) string {
-	return getRollupi(hdr, nil)
-}
-
 func getRollupi(hdr []byte, hx *hdrIndex) string {
 	r := hx.slice(JSMsgRollup, hdr)
 	if len(r) == 0 {
@@ -5750,10 +5737,6 @@ func getRollupi(hdr []byte, hx *hdrIndex) string {
 }
 
 // Fast lookup of expected stream sequence per subject.
-func getExpectedLastSeqPerSubject(hdr []byte) (uint64, bool) {
-	return getExpectedLastSeqPerSubjecti(hdr, nil)
-}
-
 func getExpectedLastSeqPerSubjecti(hdr []byte, hx *hdrIndex) (uint64, bool) {
 	bseq := hx.slice(JSExpectedLastSubjSeq, hdr)
 	if len(bseq) == 0 {
@@ -5763,10 +5746,6 @@ func getExpectedLastSeqPerSubjecti(hdr []byte, hx *hdrIndex) (uint64, bool) {
 }
 
 // Fast lookup of expected subject for the expected stream sequence per subject.
-func getExpectedLastSeqPerSubjectForSubject(hdr []byte) string {
-	return getExpectedLastSeqPerSubjectForSubjecti(hdr, nil)
-}
-
 func getExpectedLastSeqPerSubjectForSubjecti(hdr []byte, hx *hdrIndex) string {
 	return bytesToString(hx.slice(JSExpectedLastSubjSeqSubj, hdr))
 }
@@ -5814,10 +5793,6 @@ func parseMessageTTL(ttl string) (int64, error) {
 
 // Fast lookup of the message Incr from headers.
 // Return includes the value or nil, and success.
-func getMessageIncr(hdr []byte) (*big.Int, bool) {
-	return getMessageIncri(hdr, nil)
-}
-
 func getMessageIncri(hdr []byte, hx *hdrIndex) (*big.Int, bool) {
 	incr := hx.slice(JSMessageIncr, hdr)
 	if len(incr) == 0 {

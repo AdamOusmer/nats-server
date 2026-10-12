@@ -31,6 +31,9 @@ import (
 	"github.com/nats-io/nats-server/v2/server/thw"
 )
 
+// Batch eviction is distinct from purge, compact and truncate storage updates.
+const memStoreEvictionSubject = "\x00"
+
 // TODO(dlc) - This is a fairly simplistic approach but should do for now.
 type memStore struct {
 	mu          sync.RWMutex
@@ -194,7 +197,7 @@ func (ms *memStore) UpdateConfig(cfg *StreamConfig) error {
 	ms.mu.Unlock()
 
 	if em > 0 && cb != nil {
-		cb(-em, -eb, 0, _EMPTY_)
+		cb(-em, -eb, 0, memStoreEvictionSubject)
 	}
 	if cfg.MaxAge != 0 || cfg.AllowMsgTTL {
 		ms.expireMsgs()
@@ -407,7 +410,7 @@ func (ms *memStore) StoreRawMsg(subj string, hdr, msg []byte, seq uint64, ts, tt
 	ms.mu.Unlock()
 
 	if em > 0 && cb != nil {
-		cb(-em, -eb, 0, _EMPTY_)
+		cb(-em, -eb, 0, memStoreEvictionSubject)
 	}
 	if err == nil && cb != nil {
 		cb(1, int64(memStoreMsgSize(subj, hdr, msg)), seq, subj)
@@ -426,7 +429,7 @@ func (ms *memStore) StoreMsg(subj string, hdr, msg []byte, ttl int64) (uint64, i
 	em, eb := ms.takeEvictedLocked()
 	ms.mu.Unlock()
 	if em > 0 && cb != nil {
-		cb(-em, -eb, 0, _EMPTY_)
+		cb(-em, -eb, 0, memStoreEvictionSubject)
 	}
 
 	if err != nil {
@@ -1330,6 +1333,7 @@ func (ms *memStore) evictHeadBatchLocked() {
 	for s := oldFirst; s < ms.state.FirstSeq; s++ {
 		ms.dmap.Delete(s)
 	}
+	ms.shrinkIndexLocked()
 	ms.evictMsgs += int64(n)
 	ms.evictBytes += int64(bytes)
 }
@@ -2525,6 +2529,9 @@ func (ms *memStore) removeMsgNoCB(seq uint64, secure bool) (subj string, size ui
 
 	// Must delete message after updating per-subject info, to be consistent with file store.
 	ms.idxdel(seq)
+	if seq < ms.state.FirstSeq {
+		ms.shrinkIndexLocked()
+	}
 
 	return sm.subj, size, true
 }
