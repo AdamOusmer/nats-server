@@ -5596,7 +5596,8 @@ func (mset *stream) storeUpdates(md, bd int64, seq uint64, subj string) {
 		mset.store.FastState(&ss)
 		mset.clsMu.RLock()
 		for _, o := range mset.cList {
-			if subj == memStoreEvictionSubject {
+			// Only a combined head eviction can terminate messages below first.
+			if md < -1 && seq == 0 && subj == memStoreEvictionSubject {
 				o.streamRemovedBelow(ss.FirstSeq)
 			} else {
 				o.streamRecalculatePending(ss.FirstSeq)

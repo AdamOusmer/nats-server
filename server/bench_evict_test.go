@@ -68,8 +68,8 @@ func TestMemStoreEvictHeadBatch(t *testing.T) {
 	require_Equal(t, state.Msgs, limit)
 	require_Equal(t, state.Bytes, size*limit)
 	require_Equal(t, removals, 1)
-	require_Equal(t, lastSeq, 0)
-	require_Equal(t, lastSubject, memStoreEvictionSubject)
+	require_Equal(t, lastSeq, 1)
+	require_Equal(t, lastSubject, subj)
 	require_Equal(t, state.FirstSeq, 2)
 	require_Equal(t, state.NumDeleted, 1)
 	require_Equal(t, uint64(cbMsgs), state.Msgs)
@@ -91,6 +91,8 @@ func TestMemStoreEvictHeadBatch(t *testing.T) {
 	require_NoError(t, ms.UpdateConfig(&StreamConfig{Storage: MemoryStorage, MaxBytes: int64(size * 90)}))
 	state = ms.State()
 	require_Equal(t, removals, 1)
+	require_Equal(t, lastSeq, 0)
+	require_Equal(t, lastSubject, memStoreEvictionSubject)
 	require_Equal(t, state.Msgs, 90)
 	require_Equal(t, state.Bytes, size*90)
 	require_Equal(t, uint64(cbMsgs), state.Msgs)
@@ -124,18 +126,19 @@ func TestMemStoreEvictHeadBatchLimits(t *testing.T) {
 			raw        bool
 			writeSizes uint64
 			removed    int64
+			singles    int64
 			first      uint64
 			msgs       uint64
 			bytes      uint64
 		}{
 			{name: "bytes", cfg: StreamConfig{MaxBytes: int64(20 * size)}, writeSizes: 8, removed: 8, first: 9, msgs: 13, bytes: 20 * size},
 			{name: "raw-bytes", cfg: StreamConfig{MaxBytes: int64(20 * size)}, raw: true, writeSizes: 8, removed: 8, first: 9, msgs: 13, bytes: 20 * size},
-			{name: "msgs", cfg: StreamConfig{MaxMsgs: 20}, writeSizes: 1, removed: 1, first: 2, msgs: 20, bytes: 20 * size},
-			{name: "subject", cfg: StreamConfig{MaxMsgsPer: 10}, writeSizes: 1, removed: 1, first: 2, msgs: 20, bytes: 20 * size},
-			{name: "combined-write", cfg: StreamConfig{MaxMsgs: 20, MaxBytes: int64(20 * size), MaxMsgsPer: 10}, writeSizes: 8, removed: 8, first: 9, msgs: 13, bytes: 20 * size},
+			{name: "msgs", cfg: StreamConfig{MaxMsgs: 20}, writeSizes: 1, removed: 1, singles: 1, first: 2, msgs: 20, bytes: 20 * size},
+			{name: "subject", cfg: StreamConfig{MaxMsgsPer: 10}, writeSizes: 1, removed: 1, singles: 1, first: 2, msgs: 20, bytes: 20 * size},
+			{name: "combined-write", cfg: StreamConfig{MaxMsgs: 20, MaxBytes: int64(20 * size), MaxMsgsPer: 10}, writeSizes: 8, removed: 8, singles: 1, first: 9, msgs: 13, bytes: 20 * size},
 			{name: "lower-msgs", cfg: StreamConfig{MaxMsgs: 15}, update: true, removed: 5, first: 6, msgs: 15, bytes: 15 * size},
-			{name: "lower-subject", cfg: StreamConfig{MaxMsgsPer: 4}, update: true, removed: 12, first: 13, msgs: 8, bytes: 8 * size},
-			{name: "lower-combined", cfg: StreamConfig{MaxMsgs: 15, MaxBytes: int64(10 * size), MaxMsgsPer: 4}, update: true, removed: 12, first: 13, msgs: 8, bytes: 8 * size},
+			{name: "lower-subject", cfg: StreamConfig{MaxMsgsPer: 4}, update: true, removed: 12, singles: 12, first: 13, msgs: 8, bytes: 8 * size},
+			{name: "lower-combined", cfg: StreamConfig{MaxMsgs: 15, MaxBytes: int64(10 * size), MaxMsgsPer: 4}, update: true, removed: 12, singles: 2, first: 13, msgs: 8, bytes: 8 * size},
 		} {
 			t.Run(features+"/"+test.name, func(t *testing.T) {
 				cfg := test.cfg
@@ -163,18 +166,28 @@ func TestMemStoreEvictHeadBatchLimits(t *testing.T) {
 				}
 
 				// Apply all limits together on a write, or lower them together in
-				// UpdateConfig. Both operations must report only one removal update.
-				var callbacks, removed, removedBytes int64
-				var removalSeq uint64
-				var removalSubject string
+				// UpdateConfig. Only multiple head removals use a combined update.
+				var singles, markers, removed, removedBytes int64
 				ms.RegisterStorageUpdates(func(md, bd int64, seq uint64, subj string) {
 					// The callback must run after releasing the store lock.
 					ms.State()
 					if md < 0 {
-						callbacks++
 						removed -= md
 						removedBytes -= bd
-						removalSeq, removalSubject = seq, subj
+						if subj == memStoreEvictionSubject {
+							markers++
+							require_True(t, md < -1)
+							require_Equal(t, seq, 0)
+						} else {
+							singles++
+							require_Equal(t, md, -1)
+							require_True(t, seq > 0)
+							wantSubject := "a"
+							if seq%2 == 0 {
+								wantSubject = "b"
+							}
+							require_Equal(t, subj, wantSubject)
+						}
 					}
 				})
 				last := uint64(20)
@@ -191,11 +204,14 @@ func TestMemStoreEvictHeadBatchLimits(t *testing.T) {
 						require_Equal(t, seq, last)
 					}
 				}
-				require_Equal(t, callbacks, 1)
+				require_Equal(t, singles, test.singles)
+				var wantMarkers int64
+				if test.removed > test.singles {
+					wantMarkers = 1
+				}
+				require_Equal(t, markers, wantMarkers)
 				require_Equal(t, removed, test.removed)
 				require_Equal(t, removedBytes, test.removed*int64(size))
-				require_Equal(t, removalSeq, 0)
-				require_Equal(t, removalSubject, memStoreEvictionSubject)
 				state := ms.State()
 				require_Equal(t, state.FirstSeq, test.first)
 				require_Equal(t, state.LastSeq, last)
