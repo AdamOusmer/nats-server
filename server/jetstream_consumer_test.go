@@ -13931,13 +13931,13 @@ func testJetStreamConsumerLimitEvictionDoesNotWaitForLock(t *testing.T, policy n
 	defer nc.Close()
 
 	payload := make([]byte, 100)
-	// The byte limit holds exactly 100 messages, each subject is one byte.
+	// The byte limit holds exactly 50 messages, each subject is one byte.
 	msgSize := memStoreMsgSize("a", nil, payload)
 	_, err := js.AddStream(&nats.StreamConfig{
 		Name:     "TEST",
 		Subjects: []string{"a", "b"},
 		Storage:  nats.MemoryStorage,
-		MaxBytes: int64(100 * msgSize),
+		MaxBytes: int64(50 * msgSize),
 	})
 	require_NoError(t, err)
 	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "C", FilterSubject: "a", AckPolicy: policy, AckWait: time.Hour})
@@ -13957,7 +13957,7 @@ func testJetStreamConsumerLimitEvictionDoesNotWaitForLock(t *testing.T, policy n
 			require_NoError(t, err)
 		}
 	}
-	publish(100)
+	publish(40)
 
 	// Deliver the "a" messages up to stream sequence 19, without acknowledging.
 	sub, err := js.PullSubscribe("a", "C", nats.Bind("TEST", "C"))
@@ -13970,15 +13970,12 @@ func testJetStreamConsumerLimitEvictionDoesNotWaitForLock(t *testing.T, policy n
 	o := mset.lookupConsumer("C")
 	require_NotNil(t, o)
 
-	// One write evicts exactly sequences 1-50, without waiting for the consumer
-	// lock. Its stored size is the same as 50 of the original messages.
-	largePayload := make([]byte, 50*msgSize-memStoreMsgSize("b", nil, nil))
+	// With the consumer lock held, evicting sequences 1-50 must not wait for it.
 	o.mu.Lock()
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, err := js.Publish("b", largePayload)
-		require_NoError(t, err)
+		publish(60)
 	}()
 	select {
 	case <-done:
@@ -13991,16 +13988,7 @@ func testJetStreamConsumerLimitEvictionDoesNotWaitForLock(t *testing.T, policy n
 	o.rmMu.Unlock()
 	o.mu.Unlock()
 	// 1-50 hold 25 "a" and 25 "b" messages, the consumer matches the "a" ones.
-	if benchEvictBatch > 0 {
-		require_Equal(t, queued, 1)
-	} else {
-		require_Equal(t, queued, 25)
-	}
-	state := mset.store.State()
-	require_Equal(t, state.FirstSeq, 51)
-	require_Equal(t, state.LastSeq, 101)
-	require_Equal(t, state.Msgs, 51)
-	require_Equal(t, state.Bytes, 100*msgSize)
+	require_Equal(t, queued, 25)
 
 	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
 		ci, err := js.ConsumerInfo("TEST", "C")

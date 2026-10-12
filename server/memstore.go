@@ -31,7 +31,7 @@ import (
 	"github.com/nats-io/nats-server/v2/server/thw"
 )
 
-// Batch eviction is distinct from purge, compact and truncate storage updates.
+// Multiple head evictions are distinct from purge, compact and truncate updates.
 const memStoreEvictionSubject = "\x00"
 
 // TODO(dlc) - This is a fairly simplistic approach but should do for now.
@@ -56,8 +56,10 @@ type memStore struct {
 	scheduling  *MsgScheduling
 	sdm         *SDMMeta
 	sources     map[string]*StreamSourceState
-	evictMsgs   int64 // Evicted by limit enforcement, not yet reported.
+	evictMsgs   int64 // Evicted from the head, not yet reported.
 	evictBytes  int64
+	evictSeq    uint64
+	evictSubj   string
 	slabMsgs    []StoreMsg // Unused StoreMsg headers of the current slab.
 	slabBuf     []byte     // Unused bytes of the current buffer slab.
 }
@@ -167,6 +169,9 @@ func (ms *memStore) UpdateConfig(cfg *StreamConfig) error {
 	// Limits checks and enforcement.
 	ms.enforceMsgLimit()
 	ms.enforceBytesLimit()
+	// Per-subject removals release the lock for their callbacks. Take the head
+	// evictions first so a concurrent store call cannot report them as its own.
+	em, eb, eseq, esubj := ms.takeEvictedLocked()
 	// Do age timers.
 	if ms.ageChk == nil && ms.cfg.MaxAge != 0 {
 		ms.startAgeChk()
@@ -193,11 +198,10 @@ func (ms *memStore) UpdateConfig(cfg *StreamConfig) error {
 		})
 	}
 	cb := ms.scb
-	em, eb := ms.takeEvictedLocked()
 	ms.mu.Unlock()
 
 	if em > 0 && cb != nil {
-		cb(-em, -eb, 0, memStoreEvictionSubject)
+		cb(-em, -eb, eseq, esubj)
 	}
 	if cfg.MaxAge != 0 || cfg.AllowMsgTTL {
 		ms.expireMsgs()
@@ -406,11 +410,11 @@ func (ms *memStore) StoreRawMsg(subj string, hdr, msg []byte, seq uint64, ts, tt
 		// Calculate duration when the next expireMsgs should be called.
 		ms.resetAgeChk(int64(time.Millisecond) * 50)
 	}
-	em, eb := ms.takeEvictedLocked()
+	em, eb, eseq, esubj := ms.takeEvictedLocked()
 	ms.mu.Unlock()
 
 	if em > 0 && cb != nil {
-		cb(-em, -eb, 0, memStoreEvictionSubject)
+		cb(-em, -eb, eseq, esubj)
 	}
 	if err == nil && cb != nil {
 		cb(1, int64(memStoreMsgSize(subj, hdr, msg)), seq, subj)
@@ -426,10 +430,10 @@ func (ms *memStore) StoreMsg(subj string, hdr, msg []byte, ttl int64) (uint64, i
 	// This is called for a R1 with no expected sequence number, so perform DiscardNew checks on the store-level.
 	err := ms.storeRawMsg(subj, hdr, msg, seq, ts, ttl, true)
 	cb := ms.scb
-	em, eb := ms.takeEvictedLocked()
+	em, eb, eseq, esubj := ms.takeEvictedLocked()
 	ms.mu.Unlock()
 	if em > 0 && cb != nil {
-		cb(-em, -eb, 0, memStoreEvictionSubject)
+		cb(-em, -eb, eseq, esubj)
 	}
 
 	if err != nil {
@@ -1249,7 +1253,9 @@ func (ms *memStore) enforcePerSubjectLimit(subj string, ss *SimpleState) {
 		if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 			ms.recalculateForSubj(subj, ss)
 		}
-		if !ms.removeLimitMsg(ss.First) {
+		// A subject's oldest message can be inside the stream. Report its
+		// sequence so consumers terminate it even if FirstSeq does not move.
+		if !ms.removeMsg(ss.First, false) {
 			break
 		}
 	}
@@ -1292,7 +1298,7 @@ func (ms *memStore) enforceBytesLimit() {
 }
 
 // evictHeadBatchLocked removes only the oldest messages needed to satisfy
-// MaxMsgs and MaxBytes. The caller reports all limit evictions in one callback
+// MaxMsgs and MaxBytes. The caller reports head evictions in one callback
 // after unlocking.
 // Lock should be held.
 func (ms *memStore) evictHeadBatchLocked() {
@@ -1309,6 +1315,9 @@ func (ms *memStore) evictHeadBatchLocked() {
 			break
 		}
 		size := min(memStoreMsgSize(sm.subj, sm.hdr, sm.msg), ms.state.Bytes)
+		if ms.evictMsgs == 0 && n == 0 {
+			ms.evictSeq, ms.evictSubj = seq, sm.subj
+		}
 		if ms.state.Msgs > 0 {
 			ms.state.Msgs--
 		}
@@ -1335,15 +1344,18 @@ func (ms *memStore) evictHeadBatchLocked() {
 	ms.evictBytes += int64(bytes)
 }
 
-// removeLimitMsg removes a message during limit enforcement, accumulating
+// removeLimitMsg removes the first message during limit enforcement, accumulating
 // the storage update for the caller when batch eviction is enabled.
 // Lock should be held.
 func (ms *memStore) removeLimitMsg(seq uint64) bool {
 	if benchEvictBatch <= 0 {
 		return ms.removeMsg(seq, false)
 	}
-	_, size, ok := ms.removeMsgNoCB(seq, false)
+	subj, size, ok := ms.removeMsgNoCB(seq, false)
 	if ok {
+		if ms.evictMsgs == 0 {
+			ms.evictSeq, ms.evictSubj = seq, subj
+		}
 		ms.evictMsgs++
 		ms.evictBytes += int64(size)
 	}
@@ -1351,12 +1363,18 @@ func (ms *memStore) removeLimitMsg(seq uint64) bool {
 }
 
 // takeEvictedLocked returns and clears what limit enforcement removed
-// since the last call, for the caller to report once unlocked.
+// since the last call, for the caller to report once unlocked. A single eviction
+// retains its sequence and subject; only multiple head evictions use the marker.
 // Lock should be held.
-func (ms *memStore) takeEvictedLocked() (int64, int64) {
+func (ms *memStore) takeEvictedLocked() (int64, int64, uint64, string) {
 	n, b := ms.evictMsgs, ms.evictBytes
+	seq, subj := ms.evictSeq, ms.evictSubj
 	ms.evictMsgs, ms.evictBytes = 0, 0
-	return n, b
+	ms.evictSeq, ms.evictSubj = 0, _EMPTY_
+	if n > 1 {
+		seq, subj = 0, memStoreEvictionSubject
+	}
+	return n, b, seq, subj
 }
 
 // Will start the age check timer.
