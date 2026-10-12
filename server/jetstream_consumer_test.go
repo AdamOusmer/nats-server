@@ -13916,6 +13916,14 @@ func TestJetStreamConsumerEphemeralPullDefaultInactiveThresholdAfterRestart(t *t
 }
 
 func TestJetStreamConsumerAckNoneLimitEvictionDoesNotWaitForLock(t *testing.T) {
+	testJetStreamConsumerLimitEvictionDoesNotWaitForLock(t, nats.AckNonePolicy)
+}
+
+func TestJetStreamConsumerAckExplicitLimitEvictionDoesNotWaitForLock(t *testing.T) {
+	testJetStreamConsumerLimitEvictionDoesNotWaitForLock(t, nats.AckExplicitPolicy)
+}
+
+func testJetStreamConsumerLimitEvictionDoesNotWaitForLock(t *testing.T, policy nats.AckPolicy) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()
 
@@ -13932,8 +13940,12 @@ func TestJetStreamConsumerAckNoneLimitEvictionDoesNotWaitForLock(t *testing.T) {
 		MaxBytes: int64(50 * msgSize),
 	})
 	require_NoError(t, err)
-	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "NONE", FilterSubject: "a", AckPolicy: nats.AckNonePolicy})
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "C", FilterSubject: "a", AckPolicy: policy, AckWait: time.Hour})
 	require_NoError(t, err)
+
+	terms, err := nc.SubscribeSync(JSAdvisoryConsumerMsgTerminatedPre + ".TEST.C")
+	require_NoError(t, err)
+	require_NoError(t, nc.Flush())
 
 	// Odd sequences on "a", even on "b".
 	publish := func(n int) {
@@ -13947,15 +13959,15 @@ func TestJetStreamConsumerAckNoneLimitEvictionDoesNotWaitForLock(t *testing.T) {
 	}
 	publish(40)
 
-	// Deliver the "a" messages up to stream sequence 19.
-	sub, err := js.PullSubscribe("a", "NONE", nats.Bind("TEST", "NONE"))
+	// Deliver the "a" messages up to stream sequence 19, without acknowledging.
+	sub, err := js.PullSubscribe("a", "C", nats.Bind("TEST", "C"))
 	require_NoError(t, err)
 	require_Len(t, len(fetchMsgs(t, sub, 10, 5*time.Second)), 10)
 	require_NoError(t, sub.Unsubscribe())
 
 	mset, err := s.globalAccount().lookupStream("TEST")
 	require_NoError(t, err)
-	o := mset.lookupConsumer("NONE")
+	o := mset.lookupConsumer("C")
 	require_NotNil(t, o)
 
 	// With the consumer lock held, evicting sequences 1-50 must not wait for it.
@@ -13976,10 +13988,14 @@ func TestJetStreamConsumerAckNoneLimitEvictionDoesNotWaitForLock(t *testing.T) {
 	o.rmMu.Unlock()
 	o.mu.Unlock()
 	// 1-50 hold 25 "a" and 25 "b" messages, the consumer matches the "a" ones.
-	require_Equal(t, queued, 25)
+	if benchEvictBatch > 0 {
+		require_Equal(t, queued, 1)
+	} else {
+		require_Equal(t, queued, 25)
+	}
 
 	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
-		ci, err := js.ConsumerInfo("TEST", "NONE")
+		ci, err := js.ConsumerInfo("TEST", "C")
 		if err != nil {
 			return err
 		}
@@ -13993,4 +14009,123 @@ func TestJetStreamConsumerAckNoneLimitEvictionDoesNotWaitForLock(t *testing.T) {
 		return nil
 	})
 	require_False(t, o.rmQueued.Load())
+
+	// The ten delivered and unacknowledged messages are terminated, once each.
+	var want int
+	if policy != nats.AckNonePolicy {
+		want = 10
+	}
+	seen := map[uint64]bool{}
+	for range want {
+		m, err := terms.NextMsg(5 * time.Second)
+		require_NoError(t, err)
+		var e JSConsumerDeliveryTerminatedAdvisory
+		require_NoError(t, json.Unmarshal(m.Data, &e))
+		require_Equal(t, e.Reason, ackTermUnackedLimitsReason)
+		require_True(t, e.StreamSeq%2 == 1 && e.StreamSeq <= 19 && !seen[e.StreamSeq])
+		seen[e.StreamSeq] = true
+	}
+	_, err = terms.NextMsg(250 * time.Millisecond)
+	require_Error(t, err, nats.ErrTimeout)
+}
+
+func TestJetStreamConsumerPendingRemovalQueue(t *testing.T) {
+	defer func(old int) { benchEvictBatch = old }(benchEvictBatch)
+	for _, policy := range []AckPolicy{AckNone, AckExplicit, AckAll} {
+		for _, batch := range []bool{false, true} {
+			t.Run(fmt.Sprintf("policy=%s/batch=%t", policy, batch), func(t *testing.T) {
+				benchEvictBatch = 0
+				if batch {
+					benchEvictBatch = 64
+				}
+				ms, err := newMemStore(&StreamConfig{Storage: MemoryStorage})
+				require_NoError(t, err)
+				defer ms.Stop()
+				for range 100 {
+					_, _, err := ms.StoreMsg("a", nil, nil, 0)
+					require_NoError(t, err)
+				}
+				s := &Server{opts: DefaultOptions()}
+				q := &jsOutQ{newIPQueue[*jsPubMsg](s, "removal advisories")}
+				defer q.unregister()
+				mset := &stream{store: ms}
+				o := &consumer{
+					srv: s, acc: &Account{}, mset: mset, outq: q,
+					cfg: ConsumerConfig{AckPolicy: policy}, retention: LimitsPolicy,
+					sseq: 11, dseq: 11, npc: 90, npf: 100,
+					pending: make(map[uint64]*Pending),
+				}
+				o.leader.Store(true)
+				if policy != AckNone {
+					for seq := uint64(1); seq <= 10; seq++ {
+						o.pending[seq] = &Pending{Sequence: seq}
+					}
+				}
+				mset.cList = []*consumer{o}
+				ms.RegisterStorageUpdates(mset.storeUpdates)
+
+				o.mu.Lock()
+				done := make(chan error, 1)
+				go func() {
+					mset.mu.Lock()
+					defer mset.mu.Unlock()
+					if batch {
+						_, err := ms.Compact(21)
+						if err == nil {
+							_, err = ms.Compact(41)
+						}
+						done <- err
+					} else {
+						for seq := uint64(1); seq <= 40; seq++ {
+							if _, err := ms.RemoveMsg(seq); err != nil {
+								done <- err
+								return
+							}
+						}
+						done <- nil
+					}
+				}()
+				select {
+				case err := <-done:
+					o.mu.Unlock()
+					require_NoError(t, err)
+				case <-time.After(time.Second):
+					o.mu.Unlock()
+					t.Fatal("stream removals waited for the consumer lock")
+				}
+				o.mu.Lock()
+				o.applyQueuedRemovalsLocked()
+				npc := o.npc
+				o.mu.Unlock()
+				require_Equal(t, npc, 60)
+				require_False(t, o.rmQueued.Load())
+				checkFor(t, time.Second, time.Millisecond, func() error {
+					o.mu.Lock()
+					defer o.mu.Unlock()
+					if policy != AckNone && q.len() != 10 {
+						return fmt.Errorf("expected 10 advisories, got %d", q.len())
+					}
+					if len(o.pending) != 0 || len(o.rmTerm) != 0 {
+						return fmt.Errorf("pending %d, terminating %d", len(o.pending), len(o.rmTerm))
+					}
+					return nil
+				})
+				var want int
+				if policy != AckNone {
+					want = 10
+				}
+				msgs := q.pop()
+				require_Len(t, len(msgs), want)
+				seen := make(map[uint64]bool)
+				for _, msg := range msgs {
+					var e JSConsumerDeliveryTerminatedAdvisory
+					require_NoError(t, json.Unmarshal(msg.msg, &e))
+					require_Equal(t, e.Reason, ackTermUnackedLimitsReason)
+					require_True(t, e.StreamSeq >= 1 && e.StreamSeq <= 10 && !seen[e.StreamSeq])
+					seen[e.StreamSeq] = true
+					msg.returnToPool()
+				}
+			})
+		}
+	}
 }

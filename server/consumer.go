@@ -567,12 +567,11 @@ type consumer struct {
 	// Otherwise, if clustered it will be part of the consumer assignment.
 	offlineReason string
 
-	// Stream removals an AckNone consumer could not take its lock for, see
-	// decStreamPending. ackNone is set at creation, the policy cannot change.
-	ackNone  bool
+	// Stream removals decStreamPending could not take the lock for.
 	rmMu     sync.Mutex
 	rmq      []streamRemoval
 	rmQueued atomic.Bool
+	rmTerm   map[uint64]*Pending
 }
 
 // A single subject filter.
@@ -1231,7 +1230,6 @@ func (mset *stream) addConsumerWithAssignmentAndMode(config *ConsumerConfig, ona
 		client:    s.createInternalJetStreamClient(),
 		sysc:      s.createInternalJetStreamClient(),
 		cfg:       *config,
-		ackNone:   config.AckPolicy == AckNone,
 		direct:    config.Direct,
 		sourcing:  config.Sourcing,
 		dsubj:     config.DeliverSubject,
@@ -5769,6 +5767,11 @@ func (o *consumer) streamNumPendingLocked() (uint64, error) {
 func (o *consumer) streamNumPending() (uint64, error) {
 	// Removals still queued must not count against the recalculated value.
 	o.applyQueuedRemovalsLocked()
+	return o.recalculateStreamPending()
+}
+
+// Lock should be held.
+func (o *consumer) recalculateStreamPending() (uint64, error) {
 	if o.mset == nil || o.mset.store == nil || !o.isLeader() {
 		o.npc, o.npf = 0, 0
 		return 0, nil
@@ -6146,6 +6149,7 @@ func (o *consumer) removeFromRedeliverQueue(seq uint64) bool {
 func (o *consumer) checkPending() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	o.applyQueuedRemovalsLocked()
 
 	mset := o.mset
 	ttl := int64(o.cfg.AckWait)
@@ -7048,56 +7052,122 @@ func (o *consumer) requestNextMsgSubject() string {
 }
 
 func (o *consumer) decStreamPending(sseq uint64, subj string) {
-	// The stream calls this for every removed message, often with its own lock
-	// held. An AckNone consumer has no pending messages to terminate, so rather
-	// than wait for its lock it queues the removal, which is applied before the
-	// consumer next loads from the stream or reports its pending count.
-	if o.ackNone {
-		if !o.mu.TryLock() {
-			o.rmMu.Lock()
-			o.rmq = append(o.rmq, streamRemoval{sseq, subj})
-			o.rmQueued.Store(true)
-			o.rmMu.Unlock()
-			return
-		}
-		o.applyQueuedRemovalsLocked()
-	} else {
-		o.mu.Lock()
-	}
-	p, rdc, wasPending := o.decStreamPendingLocked(sseq, subj)
-	o.mu.Unlock()
-
-	// If it was pending process it like an ack.
-	if wasPending {
-		// We could have the lock for the stream so do this in a go routine.
-		// TODO(dlc) - We should do this with ipq vs naked go routines.
-		go o.processTerm(sseq, p.Sequence, rdc, ackTermUnackedLimitsReason, _EMPTY_)
-	}
+	o.processStreamRemoval(streamRemoval{seq: sseq, subj: subj})
 }
 
-// streamRemoval is a message removed from the stream.
-type streamRemoval struct {
-	seq  uint64
-	subj string
+func (o *consumer) streamRemovedBelow(first uint64) {
+	o.processStreamRemoval(streamRemoval{first: first})
 }
 
-// applyQueuedRemovalsLocked applies the removals decStreamPending queued, in
-// the order they happened.
-// Lock should be held.
-func (o *consumer) applyQueuedRemovalsLocked() {
-	if !o.rmQueued.Load() {
+func (o *consumer) processStreamRemoval(r streamRemoval) {
+	// The stream lock may be held, so a busy consumer must queue the removal.
+	if !o.mu.TryLock() {
+		o.rmMu.Lock()
+		o.rmq = append(o.rmq, r)
+		o.rmQueued.Store(true)
+		o.rmMu.Unlock()
 		return
+	}
+	q := o.takeQueuedRemovalsLocked()
+	if len(q) == 0 {
+		o.applyStreamRemovalsLocked([]streamRemoval{r})
+	} else {
+		o.applyStreamRemovalsLocked(append(q, r))
+	}
+	o.mu.Unlock()
+}
+
+// streamRemoval describes a single removal or a batch below first.
+type streamRemoval struct {
+	seq   uint64
+	subj  string
+	first uint64
+}
+
+// Lock should be held.
+func (o *consumer) takeQueuedRemovalsLocked() []streamRemoval {
+	if !o.rmQueued.Load() {
+		return nil
 	}
 	o.rmMu.Lock()
 	q := o.rmq
 	o.rmq = nil
 	o.rmQueued.Store(false)
 	o.rmMu.Unlock()
+	return q
+}
+
+// Lock should be held.
+func (o *consumer) applyQueuedRemovalsLocked() {
+	o.applyStreamRemovalsLocked(o.takeQueuedRemovalsLocked())
+}
+
+// Lock should be held.
+func (o *consumer) applyStreamRemovalsLocked(q []streamRemoval) {
+	var recalculate bool
 	for _, r := range q {
-		if p, rdc, wasPending := o.decStreamPendingLocked(r.seq, r.subj); wasPending {
-			go o.processTerm(r.seq, p.Sequence, rdc, ackTermUnackedLimitsReason, _EMPTY_)
+		if r.first > 0 {
+			recalculate = true
+			if o.rmTerm == nil {
+				o.rmTerm = make(map[uint64]*Pending)
+			}
+			break
 		}
 	}
+	for _, r := range q {
+		if r.first == 0 {
+			if p, rdc, wasPending := o.decStreamPendingLocked(r.seq, r.subj); wasPending {
+				o.terminateStreamPendingLocked(r.seq, p, rdc)
+			}
+			continue
+		}
+		var seqs []uint64
+		for seq := range o.pending {
+			if seq < r.first {
+				seqs = append(seqs, seq)
+			}
+		}
+		slices.Sort(seqs)
+		for _, seq := range seqs {
+			p, dc := o.pending[seq], o.deliveryCount(seq)
+			o.terminateStreamPendingLocked(seq, p, dc)
+		}
+		for seq := range o.rdc {
+			if seq < r.first {
+				delete(o.rdc, seq)
+				o.removeFromRedeliverQueue(seq)
+			}
+		}
+		if o.store != nil {
+			o.store.RemoveRedeliveredBelow(r.first)
+		}
+	}
+	if recalculate {
+		// Recalculate after all removals, since the store already reflects them.
+		o.recalculateStreamPending()
+	}
+}
+
+// Lock should be held.
+func (o *consumer) terminateStreamPendingLocked(seq uint64, p *Pending, dc uint64) {
+	if o.rmTerm == nil {
+		go o.processTerm(seq, p.Sequence, dc, ackTermUnackedLimitsReason, _EMPTY_)
+		return
+	}
+	// Overlapping batches can encounter the same pending termination.
+	if o.rmTerm[seq] == p {
+		return
+	}
+	o.rmTerm[seq] = p
+	dseq := p.Sequence
+	go func() {
+		o.processTerm(seq, dseq, dc, ackTermUnackedLimitsReason, _EMPTY_)
+		o.mu.Lock()
+		if o.rmTerm[seq] == p {
+			delete(o.rmTerm, seq)
+		}
+		o.mu.Unlock()
+	}()
 }
 
 // decStreamPendingLocked updates num pending and redelivery state for a

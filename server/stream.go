@@ -5596,8 +5596,12 @@ func (mset *stream) storeUpdates(md, bd int64, seq uint64, subj string) {
 		mset.store.FastState(&ss)
 		mset.clsMu.RLock()
 		for _, o := range mset.cList {
-			o.streamNumPendingLocked()
-			o.removeRedeliveredBelow(ss.FirstSeq)
+			if benchEvictBatch > 0 {
+				o.streamRemovedBelow(ss.FirstSeq)
+			} else {
+				o.streamNumPendingLocked()
+				o.removeRedeliveredBelow(ss.FirstSeq)
+			}
 		}
 		mset.clsMu.RUnlock()
 	}
