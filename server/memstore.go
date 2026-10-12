@@ -56,7 +56,7 @@ type memStore struct {
 	scheduling  *MsgScheduling
 	sdm         *SDMMeta
 	sources     map[string]*StreamSourceState
-	evictMsgs   int64 // Evicted by evictHeadBatchLocked, not yet reported.
+	evictMsgs   int64 // Evicted by limit enforcement, not yet reported.
 	evictBytes  int64
 	slabMsgs    []StoreMsg // Unused StoreMsg headers of the current slab.
 	slabBuf     []byte     // Unused bytes of the current buffer slab.
@@ -1249,7 +1249,7 @@ func (ms *memStore) enforcePerSubjectLimit(subj string, ss *SimpleState) {
 		if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 			ms.recalculateForSubj(subj, ss)
 		}
-		if !ms.removeMsg(ss.First, false) {
+		if !ms.removeLimitMsg(ss.First) {
 			break
 		}
 	}
@@ -1262,6 +1262,10 @@ func (ms *memStore) enforceMsgLimit() {
 		return
 	}
 	if ms.cfg.MaxMsgs <= 0 || ms.state.Msgs <= uint64(ms.cfg.MaxMsgs) {
+		return
+	}
+	if benchEvictBatch > 0 && ms.ttls == nil && ms.scheduling == nil {
+		ms.evictHeadBatchLocked()
 		return
 	}
 	for nmsgs := ms.state.Msgs; nmsgs > uint64(ms.cfg.MaxMsgs); nmsgs = ms.state.Msgs {
@@ -1287,11 +1291,11 @@ func (ms *memStore) enforceBytesLimit() {
 	}
 }
 
-// evictHeadBatchLocked removes the oldest messages until the store is under
-// MaxBytes, reporting one combined storage callback after unlocking.
+// evictHeadBatchLocked removes only the oldest messages needed to satisfy
+// MaxMsgs and MaxBytes. The caller reports all limit evictions in one callback
+// after unlocking.
 // Lock should be held.
 func (ms *memStore) evictHeadBatchLocked() {
-	limit := uint64(ms.cfg.MaxBytes)
 	var n, bytes uint64
 	oldFirst, last := ms.state.FirstSeq, ms.state.LastSeq
 	seq := oldFirst
@@ -1300,7 +1304,8 @@ func (ms *memStore) evictHeadBatchLocked() {
 		if !ok {
 			continue
 		}
-		if ms.state.Bytes <= limit {
+		if (ms.cfg.MaxMsgs <= 0 || ms.state.Msgs <= uint64(ms.cfg.MaxMsgs)) &&
+			(ms.cfg.MaxBytes <= 0 || ms.state.Bytes <= uint64(ms.cfg.MaxBytes)) {
 			break
 		}
 		size := min(memStoreMsgSize(sm.subj, sm.hdr, sm.msg), ms.state.Bytes)
@@ -1330,7 +1335,22 @@ func (ms *memStore) evictHeadBatchLocked() {
 	ms.evictBytes += int64(bytes)
 }
 
-// takeEvictedLocked returns and clears what evictHeadBatchLocked removed
+// removeLimitMsg removes a message during limit enforcement, accumulating
+// the storage update for the caller when batch eviction is enabled.
+// Lock should be held.
+func (ms *memStore) removeLimitMsg(seq uint64) bool {
+	if benchEvictBatch <= 0 {
+		return ms.removeMsg(seq, false)
+	}
+	_, size, ok := ms.removeMsgNoCB(seq, false)
+	if ok {
+		ms.evictMsgs++
+		ms.evictBytes += int64(size)
+	}
+	return ok
+}
+
+// takeEvictedLocked returns and clears what limit enforcement removed
 // since the last call, for the caller to report once unlocked.
 // Lock should be held.
 func (ms *memStore) takeEvictedLocked() (int64, int64) {
@@ -1944,7 +1964,7 @@ func (ms *memStore) deleteFirstMsgOrPanic() {
 }
 
 func (ms *memStore) deleteFirstMsg() bool {
-	return ms.removeMsg(ms.state.FirstSeq, false)
+	return ms.removeLimitMsg(ms.state.FirstSeq)
 }
 
 // SubjectForSeq will return what the subject is for this sequence if found.

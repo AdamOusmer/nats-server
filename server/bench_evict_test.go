@@ -13,7 +13,10 @@
 
 package server
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestMemStoreEvictHeadBatch(t *testing.T) {
 	defer func(old int) { benchEvictBatch = old }(benchEvictBatch)
@@ -29,12 +32,14 @@ func TestMemStoreEvictHeadBatch(t *testing.T) {
 
 	var cbMsgs, cbBytes, removals int64
 	var lastSeq uint64
+	var lastSubject string
 	ms.RegisterStorageUpdates(func(md, bd int64, seq uint64, subj string) {
 		cbMsgs += md
 		cbBytes += bd
 		if md < 0 {
 			removals++
 			lastSeq = seq
+			lastSubject = subj
 		}
 	})
 
@@ -64,6 +69,7 @@ func TestMemStoreEvictHeadBatch(t *testing.T) {
 	require_Equal(t, state.Bytes, size*limit)
 	require_Equal(t, removals, 1)
 	require_Equal(t, lastSeq, 0)
+	require_Equal(t, lastSubject, memStoreEvictionSubject)
 	require_Equal(t, state.FirstSeq, 2)
 	require_Equal(t, state.NumDeleted, 1)
 	require_Equal(t, uint64(cbMsgs), state.Msgs)
@@ -102,4 +108,109 @@ func TestMemStoreEvictHeadBatch(t *testing.T) {
 	require_Equal(t, state.Msgs, 3)
 	require_Equal(t, state.FirstSeq, 2)
 	require_Equal(t, state.LastSeq, 4)
+}
+
+func TestMemStoreEvictHeadBatchLimits(t *testing.T) {
+	defer func(old int) { benchEvictBatch = old }(benchEvictBatch)
+	benchEvictBatch = 64
+
+	msg := make([]byte, 64)
+	size := memStoreMsgSize("a", nil, msg)
+	for _, features := range []string{"plain", "ttl", "scheduling"} {
+		for _, test := range []struct {
+			name       string
+			cfg        StreamConfig
+			update     bool
+			raw        bool
+			writeSizes uint64
+			removed    int64
+			first      uint64
+			msgs       uint64
+			bytes      uint64
+		}{
+			{name: "bytes", cfg: StreamConfig{MaxBytes: int64(20 * size)}, writeSizes: 8, removed: 8, first: 9, msgs: 13, bytes: 20 * size},
+			{name: "raw-bytes", cfg: StreamConfig{MaxBytes: int64(20 * size)}, raw: true, writeSizes: 8, removed: 8, first: 9, msgs: 13, bytes: 20 * size},
+			{name: "msgs", cfg: StreamConfig{MaxMsgs: 20}, writeSizes: 1, removed: 1, first: 2, msgs: 20, bytes: 20 * size},
+			{name: "subject", cfg: StreamConfig{MaxMsgsPer: 10}, writeSizes: 1, removed: 1, first: 2, msgs: 20, bytes: 20 * size},
+			{name: "combined-write", cfg: StreamConfig{MaxMsgs: 20, MaxBytes: int64(20 * size), MaxMsgsPer: 10}, writeSizes: 8, removed: 8, first: 9, msgs: 13, bytes: 20 * size},
+			{name: "lower-msgs", cfg: StreamConfig{MaxMsgs: 15}, update: true, removed: 5, first: 6, msgs: 15, bytes: 15 * size},
+			{name: "lower-subject", cfg: StreamConfig{MaxMsgsPer: 4}, update: true, removed: 12, first: 13, msgs: 8, bytes: 8 * size},
+			{name: "lower-combined", cfg: StreamConfig{MaxMsgs: 15, MaxBytes: int64(10 * size), MaxMsgsPer: 4}, update: true, removed: 12, first: 13, msgs: 8, bytes: 8 * size},
+		} {
+			t.Run(features+"/"+test.name, func(t *testing.T) {
+				cfg := test.cfg
+				cfg.Storage = MemoryStorage
+				cfg.AllowMsgTTL = features == "ttl"
+				cfg.AllowMsgSchedules = features == "scheduling"
+				initial := cfg
+				if test.update {
+					initial.MaxMsgs, initial.MaxBytes, initial.MaxMsgsPer = 0, 0, 0
+				}
+				ms, err := newMemStore(&initial)
+				require_NoError(t, err)
+				defer ms.Stop()
+				var ttl int64
+				if cfg.AllowMsgTTL {
+					ttl = 3600
+				}
+				for i := 0; i < 20; i++ {
+					subj := "a"
+					if i%2 == 1 {
+						subj = "b"
+					}
+					_, _, err := ms.StoreMsg(subj, nil, msg, ttl)
+					require_NoError(t, err)
+				}
+
+				// Apply all limits together on a write, or lower them together in
+				// UpdateConfig. Both operations must report only one removal update.
+				var callbacks, removed, removedBytes int64
+				var removalSeq uint64
+				var removalSubject string
+				ms.RegisterStorageUpdates(func(md, bd int64, seq uint64, subj string) {
+					// The callback must run after releasing the store lock.
+					ms.State()
+					if md < 0 {
+						callbacks++
+						removed -= md
+						removedBytes -= bd
+						removalSeq, removalSubject = seq, subj
+					}
+				})
+				last := uint64(20)
+				if test.writeSizes == 0 {
+					require_NoError(t, ms.UpdateConfig(&cfg))
+				} else {
+					payload := make([]byte, test.writeSizes*size-memStoreMsgSize("a", nil, nil))
+					last++
+					if test.raw {
+						require_NoError(t, ms.StoreRawMsg("a", nil, payload, last, time.Now().UnixNano(), ttl, false))
+					} else {
+						seq, _, err := ms.StoreMsg("a", nil, payload, ttl)
+						require_NoError(t, err)
+						require_Equal(t, seq, last)
+					}
+				}
+				require_Equal(t, callbacks, 1)
+				require_Equal(t, removed, test.removed)
+				require_Equal(t, removedBytes, test.removed*int64(size))
+				require_Equal(t, removalSeq, 0)
+				require_Equal(t, removalSubject, memStoreEvictionSubject)
+				state := ms.State()
+				require_Equal(t, state.FirstSeq, test.first)
+				require_Equal(t, state.LastSeq, last)
+				require_Equal(t, state.Msgs, test.msgs)
+				require_Equal(t, state.Bytes, test.bytes)
+				require_Equal(t, state.NumDeleted, 0)
+				for seq := uint64(1); seq <= last; seq++ {
+					_, err := ms.LoadMsg(seq, nil)
+					if seq < test.first {
+						require_Error(t, err, ErrStoreMsgNotFound)
+					} else {
+						require_NoError(t, err)
+					}
+				}
+			})
+		}
+	}
 }
