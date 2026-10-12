@@ -1675,9 +1675,6 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 	if o.isLeader() {
 		o.flushAckNoneCursorLocked(true)
 	}
-	if !isLeader {
-		stopAndClearTimer(&o.ackNoneTimer)
-	}
 	wasLeader := o.leader.Swap(isLeader)
 
 	// For clustered new consumers, starting seq selection was deferred from
@@ -3145,6 +3142,10 @@ func (o *consumer) flushAckNoneCursorLocked(forward bool) {
 		} else {
 			o.propose(o.ackNoneCursor)
 		}
+	} else if o.store != nil {
+		if dseq, sseq, dc, ts, err := decodeDeliveredUpdate(o.ackNoneCursor[1:]); err == nil {
+			o.store.UpdateDelivered(dseq, sseq, dc, ts)
+		}
 	}
 	o.ackNoneCursor = nil
 }
@@ -3393,10 +3394,6 @@ func (o *consumer) processTermLocked(sseq, dseq, dc uint64, reason, reply string
 	if needLock {
 		o.mu.Lock()
 		defer o.mu.Unlock()
-	}
-
-	if o.closed {
-		return ackedInPlace
 	}
 
 	// Deliver an advisory
@@ -7197,8 +7194,10 @@ func (o *consumer) terminateStreamPendingLocked(seq uint64, p *Pending, dc uint6
 	o.rmTerm[seq] = p
 	dseq := p.Sequence
 	go func() {
-		o.processTerm(seq, dseq, dc, ackTermUnackedLimitsReason, _EMPTY_)
 		o.mu.Lock()
+		if !o.closed {
+			o.processTermLocked(seq, dseq, dc, ackTermUnackedLimitsReason, _EMPTY_, false)
+		}
 		if o.rmTerm[seq] == p {
 			delete(o.rmTerm, seq)
 		}
